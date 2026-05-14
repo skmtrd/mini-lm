@@ -51,11 +51,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 ## 使い方
 
 1. アプリを起動する
-2. DeepSeek API key を保存する
-3. `source` ディレクトリを選択する
-4. `インデックス作成/更新` を押す
-5. 回答対象ファイルにチェックを入れる
-6. 通常または高精度網羅モードで質問する
+2. `source` ディレクトリを選択する
+3. `更新` を押す
+4. 回答対象ファイルにチェックを入れる
+5. 質問する
 
 対応拡張子:
 
@@ -70,31 +69,26 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## 検索と回答
 
-通常モード:
+回答は常に高精度網羅モードで行います。
 
+- 質問観点の展開
 - SQLite FTS5
 - 日本語n-gram index
 - ローカルベクトル検索
 - Reciprocal Rank Fusion相当の統合スコア
-- ヒットチャンクと近傍チャンク
-- DeepSeek streaming回答
-- 回答後のclaim check
-
-高精度網羅モード:
-
-- 質問観点の展開
 - 選択中の全チャンクをbatch確認
 - batchごとの事実抽出
 - 抽出事実の永続保存
 - 事実統合
 - 最終回答生成
 - 回答監査
+- Markdown表示
 
-処理中、API送信中、rate limit待機、キャンセル、停止、完了は画面下部に表示されます。
+処理中、API送信中、rate limit待機、キャンセル、停止、完了はチャットの吹き出し内に表示されます。
 
 ## DeepSeek
 
-既定モデルは `deepseek-v4-flash` です。通常利用で迷わないよう、モデル、thinking、reasoning effort、temperatureなどの詳細設定はUIに出していません。
+既定モデルは `deepseek-v4-flash` です。通常利用で迷わないよう、APIキー、モデル、thinking、reasoning effort、temperatureなどの詳細設定はUIに出していません。
 
 DeepSeek APIはOpenAI互換形式の `/chat/completions` を使います。API keyはOSの安全な保存領域へ保存します。OS Keychain / Credential Managerが使えない環境では、アプリがSQLite平文フォールバックへ切り替え、画面に警告を表示します。ログにはAPI keyを保存しません。
 

@@ -765,7 +765,7 @@ async fn answer_question_inner(
         });
     }
 
-    let is_comprehensive = request.mode == "comprehensive";
+    let is_comprehensive = true;
     if is_comprehensive {
         answer_comprehensively(app, state, &settings, request, run_id, cancel, started, search.hits).await
     } else {
@@ -1751,7 +1751,7 @@ async fn build_question_profile(
     let messages = vec![
         json!({
             "role": "system",
-            "content": "質問から、ローカル文書検索に使う日本語検索語、同義語、表記揺れ、観点をJSONだけで返してください。形式: {\"terms\":[\"...\"],\"aspects\":[\"...\"]}"
+            "content": "質問から、ローカル文書検索に使う日本語検索語、同義語、表記揺れ、観点をJSONだけで返してください。質問が「どうなっていますか」「できますか」「対象ですか」のような形なら、直接回答に必要な判断条件もaspectsへ含めてください。形式: {\"terms\":[\"...\"],\"aspects\":[\"...\"]}"
         }),
         json!({"role": "user", "content": question}),
     ];
@@ -1795,7 +1795,7 @@ async fn extract_facts_from_batch(
     let messages = vec![
         json!({
             "role": "system",
-            "content": "あなたは文書監査用の抽出器です。質問に関係する事実だけをSOURCEから抽出してください。SOURCEにない推測は禁止です。JSONだけで返してください。形式: {\"facts\":[{\"chunk_id\":123,\"statement\":\"...\",\"quote\":\"SOURCE中の短い根拠引用\"}]}"
+            "content": "あなたは文書監査用の抽出器です。質問へ直接答えるために必要な事実だけをSOURCEから抽出してください。条件、例外、対象、手続き、金額、期間、判断基準を優先してください。SOURCEにない推測は禁止です。JSONだけで返してください。形式: {\"facts\":[{\"chunk_id\":123,\"statement\":\"...\",\"quote\":\"SOURCE中の短い根拠引用\"}]}"
         }),
         json!({
             "role": "user",
@@ -1866,7 +1866,7 @@ async fn reduce_facts(
     let messages = vec![
         json!({
             "role": "system",
-            "content": "重複した抽出事実を統合し、質問への回答に必要な事実を最大80件に整理してください。JSONだけで返してください。形式: {\"keep_indexes\":[1,2,3]}"
+            "content": "重複した抽出事実を統合し、質問へ直接答えるために必要な事実を最大80件に整理してください。結論、条件、例外、対象、手続き、金額、期間、判断基準に関わる事実を優先してください。JSONだけで返してください。形式: {\"keep_indexes\":[1,2,3]}"
         }),
         json!({"role":"user","content":format!("質問:\n{}\n\nFACTS:\n{}", question, source)}),
     ];
@@ -1917,11 +1917,11 @@ async fn synthesize_answer(
     let messages = vec![
         json!({
             "role": "system",
-            "content": "あなたはローカル文書専用の回答エンジンです。FACTSだけを根拠に回答してください。各主要主張に [F1] のような出典を付けてください。FACTSにない情報は根拠不足としてください。"
+            "content": "あなたはローカル文書専用の回答エンジンです。FACTSだけを根拠に回答してください。最優先は、質問に直接答えることです。情報の列挙だけで終わらせず、まず結論を明示し、その後に条件、例外、根拠を整理してください。各主要主張に [F1] のような出典を付けてください。FACTSにない情報は根拠不足としてください。Markdownで返してください。"
         }),
         json!({
             "role": "user",
-            "content": format!("質問:\n{}\n\nFACTS:\n{}\n\n要件:\n- 条件、例外、対象者、金額、期間、手続きを漏らさない\n- 文書間差分や矛盾があれば明示\n- source外推測は禁止\n- 日本語で回答", question, source)
+            "content": format!("質問:\n{}\n\nFACTS:\n{}\n\n回答要件:\n- 冒頭で質問への直接回答を書く\n- 「はい/いいえ」「対象/対象外」「できる/できない」「こう扱う」など判断できる質問では、まず判断を示す\n- 判断に条件がある場合は、条件付きの結論として書く\n- その後に理由、条件、例外、対象者、金額、期間、手続きを整理する\n- 文書間差分や矛盾があれば明示する\n- FACTSにない推測は禁止\n- 根拠不足なら、どの点が不足かを明示する\n- 日本語で、Markdownとして読みやすく回答する", question, source)
         }),
     ];
     call_deepseek(app, settings, messages, 2_500, false, true, Some(run_id), cancel).await

@@ -1,48 +1,36 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import DOMPurify from "dompurify";
+import { marked } from "marked";
 import "./styles.css";
+
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+});
 
 const state = {
   snapshot: null,
   busy: false,
   currentRunId: null,
   currentAssistantBody: null,
-  lastHits: [],
-  lastFacts: [],
-  lastAudit: null,
+  currentAssistantRaw: "",
+  currentAssistantHasAnswer: false,
 };
 
 document.querySelector("#app").innerHTML = `
   <div class="shell">
     <aside class="sidebar">
-      <header class="brand">
-        <div>
-          <h1>mini-lm</h1>
-          <p>Native local source QA</p>
-        </div>
-        <span id="appStateBadge" class="badge">起動中</span>
-      </header>
-
-      <section class="panel">
-        <div class="panel-title">
-          <h2>DeepSeek</h2>
-        </div>
-        <div class="simple-status">
-          <span id="apiKeyStatus" class="muted">未確認</span>
-          <strong>自動設定で使用します</strong>
-        </div>
-        <p id="apiStorageWarning" class="warning">APIキーを確認しています。</p>
-      </section>
-
-      <section class="panel source-panel">
-        <div class="panel-title">
-          <h2>Source</h2>
-          <button id="chooseSourceButton" class="icon-text" type="button">選択</button>
+      <section class="source-panel">
+        <div class="source-head">
+          <h2>資料</h2>
+          <button id="chooseSourceButton" type="button">フォルダ選択</button>
         </div>
         <div id="sourcePath" class="path-box">未設定</div>
+        <div id="stats" class="stats compact"></div>
         <div class="source-actions">
-          <button id="indexButton" class="primary" type="button">インデックス作成/更新</button>
+          <button id="indexButton" class="primary" type="button">更新</button>
           <button id="selectAllButton" type="button">全選択</button>
           <button id="clearSelectionButton" type="button">解除</button>
         </div>
@@ -51,67 +39,33 @@ document.querySelector("#app").innerHTML = `
     </aside>
 
     <main class="main">
-      <section class="topbar">
-        <div>
-          <h2>質問</h2>
-          <p>選択されたsourceだけから検索、抽出、検証して回答します。</p>
-        </div>
-        <div class="mode-switch" role="radiogroup" aria-label="answer mode">
-          <label><input type="radio" name="mode" value="normal" checked />通常</label>
-          <label><input type="radio" name="mode" value="comprehensive" />高精度網羅</label>
-        </div>
-      </section>
-
       <section id="messages" class="messages">
-        <article class="message system">
-          <div class="meta">system</div>
-          <div class="body">sourceディレクトリを選び、インデックスを作成してから質問してください。</div>
+        <article class="message assistant">
+          <div class="body markdown-body">
+            <p>資料を選択してインデックスを作成すると、選択中の資料だけを根拠に回答します。</p>
+          </div>
         </article>
       </section>
 
-      <section id="runStatus" class="run-status idle">
-        <div class="status-dot"></div>
-        <div>
-          <strong id="runStatusTitle">待機中</strong>
-          <span id="runStatusDetail">処理はありません</span>
-        </div>
-        <button id="cancelButton" type="button" disabled>停止</button>
-      </section>
-
       <form id="questionForm" class="composer">
-        <textarea id="questionInput" rows="3" placeholder="例: 扶養手当について、対象者・金額・条件・手続きを網羅して"></textarea>
+        <textarea
+          id="questionInput"
+          rows="3"
+          placeholder="質問を入力..."
+        ></textarea>
         <div class="composer-actions">
-          <button id="searchOnlyButton" type="button">検索だけ</button>
           <button id="clearMessagesButton" type="button">履歴クリア</button>
-          <button id="sendButton" class="primary" type="submit">質問する</button>
+          <button id="cancelButton" type="button" disabled>停止</button>
+          <button id="sendButton" class="primary" type="submit">送信</button>
         </div>
       </form>
     </main>
-
-    <aside class="inspector">
-      <section class="panel">
-        <h2>状態</h2>
-        <div id="stats" class="stats"></div>
-      </section>
-      <section class="panel">
-        <h2>検索結果</h2>
-        <div id="hitList" class="hit-list empty">まだ検索していません</div>
-      </section>
-      <section class="panel">
-        <h2>抽出/検証</h2>
-        <div id="factList" class="fact-list empty">高精度網羅の結果がここに出ます</div>
-        <pre id="auditBox" class="audit-box"></pre>
-      </section>
-    </aside>
   </div>
 `;
 
 const $ = (selector) => document.querySelector(selector);
 
 const els = {
-  appStateBadge: $("#appStateBadge"),
-  apiKeyStatus: $("#apiKeyStatus"),
-  apiStorageWarning: $("#apiStorageWarning"),
   chooseSourceButton: $("#chooseSourceButton"),
   sourcePath: $("#sourcePath"),
   indexButton: $("#indexButton"),
@@ -120,18 +74,11 @@ const els = {
   fileList: $("#fileList"),
   stats: $("#stats"),
   messages: $("#messages"),
-  runStatus: $("#runStatus"),
-  runStatusTitle: $("#runStatusTitle"),
-  runStatusDetail: $("#runStatusDetail"),
   cancelButton: $("#cancelButton"),
   questionForm: $("#questionForm"),
   questionInput: $("#questionInput"),
-  searchOnlyButton: $("#searchOnlyButton"),
   clearMessagesButton: $("#clearMessagesButton"),
   sendButton: $("#sendButton"),
-  hitList: $("#hitList"),
-  factList: $("#factList"),
-  auditBox: $("#auditBox"),
 };
 
 init();
@@ -144,8 +91,10 @@ async function init() {
   await listen("answer-delta", (event) => {
     const payload = event.payload;
     if (!state.currentAssistantBody || payload.runId !== state.currentRunId) return;
-    state.currentAssistantBody.textContent += payload.delta;
-    els.messages.scrollTop = els.messages.scrollHeight;
+    state.currentAssistantHasAnswer = true;
+    state.currentAssistantRaw += payload.delta;
+    renderMarkdown(state.currentAssistantBody, state.currentAssistantRaw);
+    scrollMessages();
   });
   await refreshSnapshot();
 }
@@ -163,12 +112,11 @@ function wireEvents() {
   });
   els.cancelButton.addEventListener("click", async () => {
     await invoke("cancel_current_task");
-    setStatus("停止要求", "現在の処理へキャンセル要求を送りました", true);
+    renderAssistantStatus("停止しています", "現在の処理へキャンセル要求を送りました。");
   });
-  els.searchOnlyButton.addEventListener("click", searchOnly);
   els.clearMessagesButton.addEventListener("click", () => {
     els.messages.innerHTML = "";
-    addMessage("system", "履歴をクリアしました。");
+    addMessage("assistant", "履歴をクリアしました。", { markdown: true });
   });
   els.questionForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -183,73 +131,43 @@ async function refreshSnapshot() {
 
 function renderSnapshot() {
   const { settings, documents, stats } = state.snapshot;
-  els.appStateBadge.textContent = documents.length ? "読込済み" : "未読込";
-  renderApiKeyStatus(settings);
   els.sourcePath.textContent = settings.sourcePath || "未設定";
   renderStats(stats);
   renderFileList(documents);
 }
 
-function renderApiKeyStatus(settings) {
-  if (!settings.apiKeySaved) {
-    els.apiKeyStatus.textContent = "APIキー未保存";
-    els.apiStorageWarning.textContent = "APIキーはOSのKeychain/Credential Managerへ保存します。";
-    els.apiStorageWarning.className = "warning";
-    return;
-  }
-
-  if (settings.apiKeyStorage === "os-keychain") {
-    els.apiKeyStatus.textContent = "APIキー保存済み（OS安全領域）";
-    els.apiStorageWarning.textContent = "APIキーはOSのKeychain/Credential Managerに保存されています。";
-    els.apiStorageWarning.className = "warning ok-text";
-    return;
-  }
-
-  if (settings.apiKeyStorage?.startsWith("sqlite-plaintext")) {
-    els.apiKeyStatus.textContent = "APIキー保存済み（平文フォールバック）";
-    els.apiStorageWarning.textContent =
-      "OSの安全領域に保存できなかったため、SQLiteに平文で保存しています。この端末内だけで使ってください。";
-    els.apiStorageWarning.className = "warning bad-text";
-    return;
-  }
-
-  els.apiKeyStatus.textContent = `APIキー保存済み（${settings.apiKeyStorage}）`;
-  els.apiStorageWarning.textContent = "APIキー保存状態を確認してください。";
-  els.apiStorageWarning.className = "warning";
-}
-
 function renderStats(stats) {
   els.stats.innerHTML = `
-    <dl>
-      <div><dt>文書</dt><dd>${formatNumber(stats.selectedDocumentCount)} / ${formatNumber(stats.documentCount)}</dd></div>
-      <div><dt>文字</dt><dd>${formatNumber(stats.selectedChars)} / ${formatNumber(stats.totalChars)}</dd></div>
-      <div><dt>チャンク</dt><dd>${formatNumber(stats.chunkCount)}</dd></div>
-      <div><dt>ベクトル</dt><dd>${formatNumber(stats.embeddingCount)}</dd></div>
-    </dl>
+    <span>選択 ${formatNumber(stats.selectedDocumentCount)} / ${formatNumber(stats.documentCount)}</span>
+    <span>${formatNumber(stats.selectedChars)}字</span>
+    <span>${formatNumber(stats.chunkCount)}チャンク</span>
   `;
 }
 
 function renderFileList(documents) {
   if (!documents.length) {
-    els.fileList.innerHTML = `<div class="empty-box">まだインデックスがありません</div>`;
+    els.fileList.innerHTML = `<div class="empty-box">まだ資料がありません</div>`;
     return;
   }
+
   els.fileList.innerHTML = documents
     .map((doc) => {
       const statusClass = doc.status === "indexed" ? "ok" : doc.status === "error" ? "bad" : "warn";
+      const statusText = doc.status === "indexed" ? "読込済み" : doc.status;
       return `
         <label class="file-row">
           <input type="checkbox" data-doc-id="${doc.id}" ${doc.selected ? "checked" : ""} />
           <span>
             <strong>${escapeHtml(doc.fileName)}</strong>
-            <small>${formatNumber(doc.charCount)}字 / ${formatNumber(doc.chunkCount)} chunks</small>
+            <small>${formatNumber(doc.charCount)}字 / ${formatNumber(doc.chunkCount)}チャンク</small>
             ${doc.error ? `<em>${escapeHtml(doc.error)}</em>` : ""}
           </span>
-          <b class="${statusClass}">${escapeHtml(doc.status)}</b>
+          <b class="${statusClass}">${escapeHtml(statusText)}</b>
         </label>
       `;
     })
     .join("");
+
   els.fileList.querySelectorAll("input[type='checkbox']").forEach((input) => {
     input.addEventListener("change", async () => {
       await invoke("set_document_selected", {
@@ -275,39 +193,24 @@ async function chooseSourceDirectory() {
 async function indexSource() {
   if (state.busy) return;
   setBusy(true);
+  const assistant = addMessage("assistant", "", { markdown: true });
+  state.currentAssistantBody = assistant.querySelector(".body");
+  state.currentAssistantRaw = "";
+  state.currentAssistantHasAnswer = false;
+
   try {
+    renderAssistantStatus("資料を読み込んでいます", "ファイルの変更を確認し、検索インデックスを更新しています。");
     const summary = await invoke("index_source_directory");
     await refreshSnapshot();
-    setStatus(
-      "インデックス完了",
-      `scan ${summary.scannedFiles}, indexed ${summary.indexedFiles}, skipped ${summary.skippedFiles}, failed ${summary.failedFiles}`,
-      false,
+    renderMarkdown(
+      state.currentAssistantBody,
+      `資料の更新が完了しました。\n\n- 読み込み: ${summary.indexedFiles}件\n- 変更なし: ${summary.skippedFiles}件\n- 失敗: ${summary.failedFiles}件`,
     );
   } catch (error) {
-    setStatus("インデックス停止", String(error), false, "bad");
+    renderMarkdown(state.currentAssistantBody, `資料の更新に失敗しました。\n\n理由: ${String(error)}`);
   } finally {
-    setBusy(false);
-  }
-}
-
-async function searchOnly() {
-  const query = els.questionInput.value.trim();
-  if (!query) return;
-  setBusy(true);
-  try {
-    const response = await invoke("hybrid_search", {
-      request: {
-        query,
-        selectedDocumentIds: selectedDocumentIds(),
-        limit: 16,
-      },
-    });
-    state.lastHits = response.hits || [];
-    renderHits(state.lastHits);
-    setStatus("検索完了", `${state.lastHits.length}件 / vector scan ${response.scannedVectors}`, false);
-  } catch (error) {
-    setStatus("検索失敗", String(error), false, "bad");
-  } finally {
+    state.currentAssistantBody = null;
+    state.currentRunId = null;
     setBusy(false);
   }
 }
@@ -315,37 +218,39 @@ async function searchOnly() {
 async function answerQuestion() {
   const question = els.questionInput.value.trim();
   if (!question || state.busy) return;
+
   setBusy(true);
   addMessage("user", question);
-  const assistant = addMessage("assistant", "");
+  els.questionInput.value = "";
+
+  const assistant = addMessage("assistant", "", { markdown: true });
   state.currentAssistantBody = assistant.querySelector(".body");
   state.currentRunId = null;
-  renderFacts([], null);
+  state.currentAssistantRaw = "";
+  state.currentAssistantHasAnswer = false;
+
   try {
-    const mode = document.querySelector("input[name='mode']:checked")?.value || "normal";
+    renderAssistantStatus("調べています", "資料全体を確認し、回答に必要な根拠を抽出しています。");
     const response = await invoke("answer_question", {
       request: {
         question,
-        mode,
+        mode: "comprehensive",
         selectedDocumentIds: selectedDocumentIds(),
       },
     });
     state.currentRunId = response.runId;
-    if (!state.currentAssistantBody.textContent.trim()) {
-      state.currentAssistantBody.textContent = response.answer;
-    }
-    state.lastHits = response.hits || [];
-    state.lastFacts = response.facts || [];
-    state.lastAudit = response.audit || null;
-    renderHits(state.lastHits);
-    renderFacts(state.lastFacts, state.lastAudit);
-    setStatus("回答完了", `run ${response.runId}`, false);
+    state.currentAssistantRaw = response.answer || state.currentAssistantRaw;
+    renderMarkdown(state.currentAssistantBody, state.currentAssistantRaw);
   } catch (error) {
-    state.currentAssistantBody.textContent += `\n\n回答に失敗しました。処理は停止しました。\n理由: ${String(error)}`;
-    setStatus("回答停止", String(error), false, "bad");
+    const message = state.currentAssistantRaw
+      ? `${state.currentAssistantRaw}\n\n---\n\n回答に失敗しました。処理は停止しました。\n\n理由: ${String(error)}`
+      : `回答に失敗しました。処理は停止しました。\n\n理由: ${String(error)}`;
+    renderMarkdown(state.currentAssistantBody, message);
   } finally {
     state.currentAssistantBody = null;
     state.currentRunId = null;
+    state.currentAssistantRaw = "";
+    state.currentAssistantHasAnswer = false;
     setBusy(false);
   }
 }
@@ -356,83 +261,75 @@ function selectedDocumentIds() {
 
 function renderProgress(payload) {
   if (payload.runId) state.currentRunId = payload.runId;
-  const total = payload.total ? ` ${payload.completed}/${payload.total}` : "";
-  const elapsed = payload.elapsedMs ? ` / ${Math.round(payload.elapsedMs / 1000)}秒` : "";
-  setStatus(
-    `${payload.stage}: ${payload.status}`,
-    `${payload.message}${total}${elapsed}`,
-    Boolean(payload.canCancel),
-    payload.status === "stopped" || payload.status === "cancelled" ? "bad" : "running",
-  );
+  if (!state.currentAssistantBody || state.currentAssistantHasAnswer) return;
+
+  const total = payload.total ? `${payload.completed}/${payload.total}` : "";
+  const elapsed = payload.elapsedMs ? `${Math.round(payload.elapsedMs / 1000)}秒` : "";
+  const detail = [payload.message, total, elapsed].filter(Boolean).join(" ・ ");
+  const title = progressTitle(payload.stage, payload.status);
+  renderAssistantStatus(title, detail);
 }
 
-function renderHits(hits) {
-  if (!hits.length) {
-    els.hitList.className = "hit-list empty";
-    els.hitList.textContent = "該当する検索結果はありません";
-    return;
-  }
-  els.hitList.className = "hit-list";
-  els.hitList.innerHTML = hits
-    .map(
-      (hit, index) => `
-        <article class="hit">
-          <header>
-            <strong>S${index + 1}. ${escapeHtml(hit.fileName)}</strong>
-            <span>${hit.score.toFixed(4)}</span>
-          </header>
-          <small>${escapeHtml(hit.headingPath || "見出しなし")} / chars ${hit.charStart}-${hit.charEnd}</small>
-          <p>${escapeHtml(hit.snippet)}</p>
-          <code>${escapeHtml(hit.debug)}</code>
-        </article>
-      `,
-    )
-    .join("");
+function progressTitle(stage, status) {
+  if (status === "cancelled") return "停止しました";
+  if (status === "stopped") return "停止しました";
+  if (status === "complete") return "まとめています";
+  const labels = {
+    profile: "質問を整理しています",
+    retrieve: "資料を探しています",
+    extract: "根拠を拾い集めています",
+    synthesize: "回答を組み立てています",
+    answer: "回答しています",
+    api: "AIに確認しています",
+    index: "資料を読み込んでいます",
+  };
+  return labels[stage] || "処理しています";
 }
 
-function renderFacts(facts, audit) {
-  if (!facts.length) {
-    els.factList.className = "fact-list empty";
-    els.factList.textContent = "抽出事実はまだありません";
-  } else {
-    els.factList.className = "fact-list";
-    els.factList.innerHTML = facts
-      .map(
-        (fact, index) => `
-          <article class="fact">
-            <strong>F${index + 1}. ${escapeHtml(fact.fileName)}</strong>
-            <p>${escapeHtml(fact.statement)}</p>
-            <small>${escapeHtml(fact.quote || "")}</small>
-          </article>
-        `,
-      )
-      .join("");
-  }
-  els.auditBox.textContent = audit || "";
+function renderAssistantStatus(title, detail) {
+  if (!state.currentAssistantBody) return;
+  state.currentAssistantBody.innerHTML = `
+    <div class="thinking">
+      <span class="thinking-dot"></span>
+      <div>
+        <strong>${escapeHtml(title)}</strong>
+        <p>${escapeHtml(detail || "")}</p>
+      </div>
+    </div>
+  `;
+  scrollMessages();
 }
 
-function addMessage(role, text) {
+function addMessage(role, text, options = {}) {
   const article = document.createElement("article");
   article.className = `message ${role}`;
-  article.innerHTML = `<div class="meta">${role}</div><div class="body"></div>`;
-  article.querySelector(".body").textContent = text;
+  article.innerHTML = `<div class="body ${options.markdown ? "markdown-body" : ""}"></div>`;
+  const body = article.querySelector(".body");
+  if (options.markdown) {
+    renderMarkdown(body, text);
+  } else {
+    body.textContent = text;
+  }
   els.messages.append(article);
-  els.messages.scrollTop = els.messages.scrollHeight;
+  scrollMessages();
   return article;
+}
+
+function renderMarkdown(element, source) {
+  element.classList.add("markdown-body");
+  element.innerHTML = DOMPurify.sanitize(marked.parse(source || ""));
 }
 
 function setBusy(busy) {
   state.busy = busy;
   els.indexButton.disabled = busy;
   els.sendButton.disabled = busy;
-  els.searchOnlyButton.disabled = busy;
+  els.cancelButton.disabled = !busy;
+  els.questionInput.disabled = busy;
 }
 
-function setStatus(title, detail, canCancel, tone = "idle") {
-  els.runStatus.className = `run-status ${tone}`;
-  els.runStatusTitle.textContent = title;
-  els.runStatusDetail.textContent = detail;
-  els.cancelButton.disabled = !canCancel;
+function scrollMessages() {
+  els.messages.scrollTop = els.messages.scrollHeight;
 }
 
 function formatNumber(value) {
