@@ -24,19 +24,6 @@
 - Vector: ローカル日本語 n-gram hash embedding
 - LLM: DeepSeek OpenAI-compatible Chat Completions API
 
-## 公開リポジトリでの注意
-
-このリポジトリは GitHub 公開を想定しています。次のものはコミットしないでください。
-
-- 実際に読み込ませる資料フォルダ
-- `source/`, `documents/`, `data/` などのローカル資料
-- `.env` などの環境変数ファイル
-- SQLite DB
-- API キー、トークン、秘密鍵
-- `node_modules/`, `dist/`, `src-tauri/target/`
-
-`.gitignore` でこれらは除外しています。資料はリポジトリ外、または ignored な `source/` などに置いて、アプリ内のフォルダ選択から指定してください。
-
 ## セットアップ
 
 ```bash
@@ -143,18 +130,7 @@ API キーはアプリ内で設定します。UI 上には詳細なモデル設�
 - answers
 - logs
 
-これらはリポジトリ管理対象ではありません。
-
-## GitHub へ公開する前の確認
-
-```bash
-git status --short --ignored
-git ls-files
-```
-
-`source/` や DB、`.env` が `git ls-files` に出ないことを確認してください。
-
-すでに資料をコミットした履歴がある場合、単に `.gitignore` に追加するだけでは不十分です。GitHub に push する前に、履歴からも資料を削除してください。
+これらはアプリのローカルデータとして保存されます。
 
 ## 既知の制限
 
