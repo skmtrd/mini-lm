@@ -317,6 +317,7 @@ button.primary {
 }
 
 .main {
+  position: relative;
   min-width: 0;
   height: 100vh;
   display: grid;
@@ -327,6 +328,17 @@ button.primary {
 .messages {
   overflow: auto;
   padding: 22px clamp(18px, 4vw, 52px);
+}
+
+.jump-latest {
+  position: absolute;
+  right: clamp(18px, 4vw, 52px);
+  bottom: 126px;
+  z-index: 5;
+  border-color: #b8c7d1;
+  background: #ffffff;
+  box-shadow: 0 8px 20px rgb(31 37 43 / 13%);
+  font-size: 12px;
 }
 
 .message {

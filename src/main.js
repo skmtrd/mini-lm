@@ -18,6 +18,7 @@ const state = {
   currentAssistantRaw: "",
   currentAssistantHasAnswer: false,
   toastSeq: 0,
+  autoScroll: true,
 };
 
 document.querySelector("#app").innerHTML = `
@@ -48,6 +49,7 @@ document.querySelector("#app").innerHTML = `
           </div>
         </article>
       </section>
+      <button id="jumpToLatestButton" class="jump-latest" type="button" hidden>最新へ</button>
 
       <form id="questionForm" class="composer">
         <textarea
@@ -80,6 +82,7 @@ const els = {
   fileList: $("#fileList"),
   stats: $("#stats"),
   messages: $("#messages"),
+  jumpToLatestButton: $("#jumpToLatestButton"),
   cancelButton: $("#cancelButton"),
   questionForm: $("#questionForm"),
   questionInput: $("#questionInput"),
@@ -98,10 +101,11 @@ async function init() {
   await listen("answer-delta", (event) => {
     const payload = event.payload;
     if (!state.currentAssistantBody || payload.runId !== state.currentRunId) return;
+    const shouldStick = shouldAutoScroll();
     state.currentAssistantHasAnswer = true;
     state.currentAssistantRaw += payload.delta;
     renderMarkdown(state.currentAssistantBody, state.currentAssistantRaw);
-    scrollMessages();
+    scrollMessages({ force: shouldStick });
   });
   await refreshSnapshot();
 }
@@ -124,6 +128,14 @@ function wireEvents() {
   els.clearMessagesButton.addEventListener("click", () => {
     clearMessages();
     showToast("履歴をクリアしました", "チャット欄を空にしました。", "info");
+  });
+  els.messages.addEventListener("scroll", () => {
+    state.autoScroll = isNearBottom();
+    renderJumpButton();
+  });
+  els.jumpToLatestButton.addEventListener("click", () => {
+    state.autoScroll = true;
+    scrollMessages({ force: true });
   });
   els.questionForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -249,12 +261,16 @@ async function answerQuestion() {
     });
     state.currentRunId = response.runId;
     state.currentAssistantRaw = response.answer || state.currentAssistantRaw;
+    const shouldStick = shouldAutoScroll();
     renderMarkdown(state.currentAssistantBody, state.currentAssistantRaw);
+    scrollMessages({ force: shouldStick });
   } catch (error) {
     const message = state.currentAssistantRaw
       ? `${state.currentAssistantRaw}\n\n---\n\n回答に失敗しました。処理は停止しました。\n\n理由: ${String(error)}`
       : `回答に失敗しました。処理は停止しました。\n\n理由: ${String(error)}`;
+    const shouldStick = shouldAutoScroll();
     renderMarkdown(state.currentAssistantBody, message);
+    scrollMessages({ force: shouldStick });
   } finally {
     state.currentAssistantBody = null;
     state.currentRunId = null;
@@ -322,6 +338,7 @@ function progressTitle(payload) {
 
 function renderAssistantStatus(title, detail, payload = {}) {
   if (!state.currentAssistantBody) return;
+  const shouldStick = shouldAutoScroll();
   const percent = payload.total ? Math.min(100, Math.round((payload.completed / payload.total) * 100)) : 0;
   const stageClass = payload.stage ? `stage-${payload.stage}` : "stage-idle";
   state.currentAssistantBody.innerHTML = `
@@ -338,7 +355,7 @@ function renderAssistantStatus(title, detail, payload = {}) {
       </div>
     </div>
   `;
-  scrollMessages();
+  scrollMessages({ force: shouldStick });
 }
 
 function showToast(title, detail = "", tone = "info", options = {}) {
@@ -385,7 +402,7 @@ function addMessage(role, text, options = {}) {
     body.textContent = text;
   }
   els.messages.append(article);
-  scrollMessages();
+  scrollMessages({ force: role === "user" || shouldAutoScroll() });
   return article;
 }
 
@@ -402,8 +419,26 @@ function setBusy(busy) {
   els.questionInput.disabled = busy;
 }
 
-function scrollMessages() {
-  els.messages.scrollTop = els.messages.scrollHeight;
+function shouldAutoScroll() {
+  return state.autoScroll || isNearBottom();
+}
+
+function isNearBottom() {
+  const distance = els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight;
+  return distance < 96;
+}
+
+function scrollMessages(options = {}) {
+  if (options.force) {
+    els.messages.scrollTop = els.messages.scrollHeight;
+    state.autoScroll = true;
+  }
+  renderJumpButton();
+}
+
+function renderJumpButton() {
+  const show = !state.autoScroll && !isNearBottom();
+  els.jumpToLatestButton.hidden = !show;
 }
 
 function formatNumber(value) {
