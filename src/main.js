@@ -283,37 +283,58 @@ function renderProgress(payload) {
   if (payload.runId) state.currentRunId = payload.runId;
   if (!state.currentAssistantBody || state.currentAssistantHasAnswer) return;
 
-  const total = payload.total ? `${payload.completed}/${payload.total}` : "";
+  const total = payload.total ? `${formatNumber(payload.completed)}/${formatNumber(payload.total)}` : "";
   const elapsed = payload.elapsedMs ? `${Math.round(payload.elapsedMs / 1000)}秒` : "";
   const detail = [payload.message, total, elapsed].filter(Boolean).join(" ・ ");
-  const title = progressTitle(payload.stage, payload.status);
-  renderAssistantStatus(title, detail);
+  const title = progressTitle(payload);
+  renderAssistantStatus(title, detail, payload);
 }
 
-function progressTitle(stage, status) {
+function progressTitle(payload) {
+  const { stage, status, message = "", completed = 0, total = 0 } = payload;
   if (status === "cancelled") return "停止しました";
   if (status === "stopped") return "停止しました";
-  if (status === "complete") return "まとめています";
-  const labels = {
-    profile: "質問を整理しています",
-    retrieve: "資料を探しています",
-    extract: "根拠を拾い集めています",
-    synthesize: "回答を組み立てています",
-    answer: "回答しています",
-    api: "AIに確認しています",
-    index: "資料を読み込んでいます",
-  };
-  return labels[stage] || "処理しています";
+  if (status === "complete") return "仕上げています";
+
+  if (stage === "profile") return "質問の意図を整理しています";
+  if (stage === "retrieve") return "関連しそうな資料を探しています";
+  if (stage === "extract") {
+    if (message.includes("追加検索") || message.includes("再確認")) return "見落としがないか再確認しています";
+    if (total > 0) {
+      const ratio = completed / total;
+      if (ratio < 0.25) return "資料を読み始めています";
+      if (ratio < 0.7) return "根拠を拾い集めています";
+      return "条件や例外を照合しています";
+    }
+    return "根拠を抽出しています";
+  }
+  if (stage === "synthesize") return "根拠を統合しています";
+  if (stage === "audit") return "回答のズレを点検しています";
+  if (stage === "answer") return "回答を整えています";
+  if (stage === "api") {
+    if (message.includes("制限")) return "API制限の回復を待っています";
+    if (message.includes("停止")) return "API応答で停止しました";
+    return "AIに処理を依頼しています";
+  }
+  if (stage === "index") return "資料を読み込んでいます";
+  return "処理しています";
 }
 
-function renderAssistantStatus(title, detail) {
+function renderAssistantStatus(title, detail, payload = {}) {
   if (!state.currentAssistantBody) return;
+  const percent = payload.total ? Math.min(100, Math.round((payload.completed / payload.total) * 100)) : 0;
+  const stageClass = payload.stage ? `stage-${payload.stage}` : "stage-idle";
   state.currentAssistantBody.innerHTML = `
-    <div class="thinking">
+    <div class="thinking ${stageClass}">
       <span class="thinking-dot"></span>
       <div>
         <strong>${escapeHtml(title)}</strong>
         <p>${escapeHtml(detail || "")}</p>
+        ${
+          payload.total
+            ? `<div class="progress-track" aria-hidden="true"><span style="width: ${percent}%"></span></div>`
+            : ""
+        }
       </div>
     </div>
   `;
