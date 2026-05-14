@@ -246,7 +246,8 @@ button.primary {
   font-size: 12px;
 }
 
-.history-archive-button {
+.history-archive-button,
+.history-menu-button {
   position: absolute;
   top: 50%;
   right: 6px;
@@ -264,18 +265,59 @@ button.primary {
 }
 
 .history-row:hover .history-archive-button,
-.history-archive-button:focus-visible {
+.history-row:hover .history-menu-button,
+.history-archive-button:focus-visible,
+.history-menu-button:focus-visible,
+.history-menu-button[aria-expanded="true"] {
   opacity: 1;
 }
 
-.history-archive-button:hover:not(:disabled) {
+.history-archive-button:hover:not(:disabled),
+.history-menu-button:hover:not(:disabled) {
   border-color: #cbd5dc;
   background: #ffffff;
 }
 
-.history-archive-button .action-icon {
+.history-archive-button .action-icon,
+.history-menu-button .action-icon {
   width: 16px;
   height: 16px;
+}
+
+.history-menu-button .action-icon {
+  fill: currentColor;
+  stroke: none;
+}
+
+.history-menu {
+  position: absolute;
+  top: calc(100% - 4px);
+  right: 6px;
+  z-index: 8;
+  display: grid;
+  min-width: 142px;
+  overflow: hidden;
+  border: 1px solid #cbd5dc;
+  border-radius: 6px;
+  background: #ffffff;
+  box-shadow: 0 12px 24px rgb(31 37 43 / 14%);
+}
+
+.history-menu button {
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  padding: 9px 10px;
+  background: #ffffff;
+  text-align: left;
+}
+
+.history-menu button:hover:not(:disabled) {
+  background: #f3f6f7;
+}
+
+.history-menu button.danger {
+  color: #a01818;
 }
 
 .history-empty {

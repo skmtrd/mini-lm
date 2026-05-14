@@ -35,6 +35,7 @@ const state = {
   toastSeq: 0,
   autoScroll: true,
   lastProgressStage: "profile",
+  openHistoryMenuId: null,
 };
 
 document.querySelector("#app").innerHTML = `
@@ -59,13 +60,7 @@ document.querySelector("#app").innerHTML = `
 
     <main class="main">
       <div class="message-area">
-        <section id="messages" class="messages">
-          <article class="message assistant">
-            <div class="body markdown-body">
-              <p>資料を選択してインデックスを作成すると、選択中の資料だけを根拠に回答します。</p>
-            </div>
-          </article>
-        </section>
+        <section id="messages" class="messages"></section>
         <button id="jumpToLatestButton" class="jump-latest" type="button" hidden title="最新へ" aria-label="最新へ">
           <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
             <path d="M12 5v14"></path>
@@ -169,6 +164,11 @@ function wireEvents() {
     renderAssistantStatus("停止しています");
   });
   els.newChatButton.addEventListener("click", startNewChat);
+  document.addEventListener("click", (event) => {
+    if (!state.openHistoryMenuId || event.target.closest(".history-sidebar")) return;
+    state.openHistoryMenuId = null;
+    renderChatSidebar();
+  });
   els.messages.addEventListener("scroll", () => {
     state.autoScroll = isNearBottom();
     renderJumpButton();
@@ -185,6 +185,24 @@ function wireEvents() {
     const archiveButton = event.target.closest("[data-archive-chat-id]");
     if (archiveButton) {
       archiveChat(archiveButton.dataset.archiveChatId);
+      return;
+    }
+
+    const menuButton = event.target.closest("[data-archived-menu-id]");
+    if (menuButton) {
+      toggleArchivedChatMenu(menuButton.dataset.archivedMenuId);
+      return;
+    }
+
+    const restoreButton = event.target.closest("[data-restore-archived-chat-id]");
+    if (restoreButton) {
+      restoreArchivedChat(restoreButton.dataset.restoreArchivedChatId);
+      return;
+    }
+
+    const deleteButton = event.target.closest("[data-delete-archived-chat-id]");
+    if (deleteButton) {
+      deleteArchivedChat(deleteButton.dataset.deleteArchivedChatId);
       return;
     }
 
@@ -365,12 +383,14 @@ function startNewChat() {
   if (state.busy) return;
   saveCurrentChat();
   selectDraftChat();
+  state.openHistoryMenuId = null;
   renderCurrentMessages();
   renderChatSidebar();
 }
 
 function archiveChat(id) {
   if (state.busy) return;
+  state.openHistoryMenuId = null;
   if (state.currentChatStatus === "active" && state.currentChatId === id) {
     saveCurrentChat();
   }
@@ -406,6 +426,53 @@ function archiveChat(id) {
   renderChatSidebar();
 }
 
+function toggleArchivedChatMenu(id) {
+  if (state.busy) return;
+  state.openHistoryMenuId = state.openHistoryMenuId === id ? null : id;
+  renderChatSidebar();
+}
+
+function restoreArchivedChat(id) {
+  if (state.busy) return;
+  const chat = state.archivedChats.find((item) => item.id === id);
+  if (!chat) return;
+
+  const active = {
+    ...chat,
+    updatedAt: Date.now(),
+  };
+  state.openHistoryMenuId = null;
+  state.archivedChats = state.archivedChats.filter((item) => item.id !== id);
+  state.activeChats = [active, ...state.activeChats.filter((item) => item.id !== id)].slice(0, 80);
+  selectChat(active, "active");
+  persistChatStore();
+  renderCurrentMessages();
+  renderChatSidebar();
+  showToast("アクティブに戻しました", "", "success");
+}
+
+function deleteArchivedChat(id) {
+  if (state.busy) return;
+  const chat = state.archivedChats.find((item) => item.id === id);
+  if (!chat) return;
+
+  state.openHistoryMenuId = null;
+  state.archivedChats = state.archivedChats.filter((item) => item.id !== id);
+  if (state.currentChatStatus === "archived" && state.currentChatId === id) {
+    const next = state.activeChats[0];
+    if (next) {
+      selectChat(next, "active");
+    } else {
+      selectDraftChat();
+    }
+    renderCurrentMessages();
+  }
+
+  persistChatStore();
+  renderChatSidebar();
+  showToast("削除しました", "", "success");
+}
+
 function saveCurrentChat() {
   const messages = state.currentMessages
     .filter((message) => message.text && message.text.trim())
@@ -439,6 +506,7 @@ function loadChatSession(id, status) {
   saveCurrentChat();
   const chat = findChat(id, status);
   if (!chat) return;
+  state.openHistoryMenuId = null;
   selectChat(chat, status);
   renderCurrentMessages();
   renderChatSidebar();
@@ -461,6 +529,7 @@ function promoteCurrentArchivedChat() {
   state.activeChats = [active, ...state.activeChats.filter((item) => item.id !== chat.id)].slice(0, 80);
   state.currentChatStatus = "active";
   state.currentChatId = active.id;
+  state.openHistoryMenuId = null;
   persistChatStore();
   renderChatSidebar();
 }
@@ -543,6 +612,7 @@ function renderChatSection(title, chats, status) {
 
 function renderChatItem(chat, status) {
   const active = chat.id === state.currentChatId && status === state.currentChatStatus ? " active" : "";
+  const menuOpen = status === "archived" && state.openHistoryMenuId === chat.id;
   const archiveAction =
     status === "active" && hasConversationMessages(chat)
       ? `
@@ -553,6 +623,26 @@ function renderChatItem(chat, status) {
             <path d="M10 13h4"></path>
           </svg>
         </button>
+      `
+      : status === "archived"
+        ? `
+        <button class="history-menu-button" type="button" data-archived-menu-id="${escapeHtml(chat.id)}" title="メニュー" aria-label="メニュー" aria-haspopup="menu" aria-expanded="${menuOpen ? "true" : "false"}">
+          <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+            <circle cx="12" cy="5" r="1.8"></circle>
+            <circle cx="12" cy="12" r="1.8"></circle>
+            <circle cx="12" cy="19" r="1.8"></circle>
+          </svg>
+        </button>
+        ${
+          menuOpen
+            ? `
+          <div class="history-menu" role="menu">
+            <button type="button" role="menuitem" data-restore-archived-chat-id="${escapeHtml(chat.id)}">アクティブに戻す</button>
+            <button class="danger" type="button" role="menuitem" data-delete-archived-chat-id="${escapeHtml(chat.id)}">削除</button>
+          </div>
+        `
+            : ""
+        }
       `
       : "";
   return `
@@ -587,13 +677,7 @@ function renderCurrentMessages() {
 }
 
 function renderEmptyConversation() {
-  els.messages.innerHTML = `
-    <article class="message assistant">
-      <div class="body markdown-body">
-        <p>資料を選択してインデックスを作成すると、選択中の資料だけを根拠に回答します。</p>
-      </div>
-    </article>
-  `;
+  els.messages.innerHTML = "";
   scrollMessages({ force: true });
 }
 
@@ -947,6 +1031,7 @@ function resolveTypewriterWaiters() {
 
 function setBusy(busy) {
   state.busy = busy;
+  if (busy) state.openHistoryMenuId = null;
   els.sidebar.classList.toggle("is-locked", busy);
   els.historySidebar.classList.toggle("is-locked", busy);
   els.chooseSourceButton.disabled = busy;
