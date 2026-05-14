@@ -41,6 +41,7 @@ const state = {
 document.querySelector("#app").innerHTML = `
   <div class="shell">
     <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="false"></div>
+    <div class="window-drag-region" data-tauri-drag-region></div>
     <aside class="sidebar source-sidebar">
       <section class="source-panel">
         <div class="source-head">
@@ -92,9 +93,6 @@ document.querySelector("#app").innerHTML = `
     </main>
 
     <aside class="history-sidebar">
-      <div class="history-head">
-        <h2>履歴</h2>
-      </div>
       <button id="newChatButton" class="new-chat-button" type="button">
         <span aria-hidden="true">＋</span>
         新しいチャット

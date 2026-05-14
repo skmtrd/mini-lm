@@ -1,4 +1,5 @@
 :root {
+  --window-drag-height: 38px;
   color: #1f252b;
   background: #f5f7f8;
   font-family:
@@ -138,9 +139,18 @@ button.primary {
   overflow: hidden;
 }
 
+.window-drag-region {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 9;
+  height: var(--window-drag-height);
+}
+
 .sidebar {
   overflow: auto;
-  padding: 14px;
+  padding: calc(14px + var(--window-drag-height)) 14px 14px;
   border-right: 1px solid #d8e0e6;
   background: #eef2f4;
 }
@@ -151,26 +161,13 @@ button.primary {
 
 .history-sidebar {
   overflow: auto;
-  padding: 14px;
+  padding: calc(14px + var(--window-drag-height)) 14px 14px;
   border-left: 1px solid #d8e0e6;
   background: #f2f5f7;
 }
 
 .history-sidebar.is-locked {
   opacity: 0.78;
-}
-
-.history-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 10px;
-}
-
-.history-head h2 {
-  margin: 0;
-  font-size: 16px;
-  letter-spacing: 0;
 }
 
 .new-chat-button {
@@ -473,7 +470,7 @@ button.primary {
 .messages {
   min-height: 0;
   overflow: auto;
-  padding: 22px clamp(18px, 4vw, 52px);
+  padding: calc(22px + var(--window-drag-height)) clamp(18px, 4vw, 52px) 22px;
 }
 
 .jump-latest {
