@@ -277,11 +277,7 @@ button.primary {
   opacity: 1;
 }
 
-.history-archive-button:hover:not(:disabled) {
-  border-color: #cbd5dc;
-  background: #ffffff;
-}
-
+.history-archive-button:hover:not(:disabled),
 .history-menu-button:hover:not(:disabled) {
   border-color: transparent;
   background: transparent;
