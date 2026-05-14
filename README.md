@@ -1,4 +1,4 @@
-# mini-lm Native
+# mini-lm
 
 ローカルのテキスト資料だけを根拠に回答する、NotebookLM 風のデスクトップアプリです。macOS / Windows 両対応を前提に、Tauri 2 + Rust + Vite で構成しています。
 
