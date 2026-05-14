@@ -10,15 +10,18 @@ marked.setOptions({
   gfm: true,
 });
 
-const ARCHIVE_STORAGE_KEY = "mini-lm.archivedSessions.v1";
+const CHAT_STORAGE_KEY = "mini-lm.chatSessions.v2";
+const LEGACY_ARCHIVE_STORAGE_KEY = "mini-lm.archivedSessions.v1";
 const TYPEWRITER_INTERVAL_MS = 16;
 const TYPEWRITER_CHARS_PER_TICK = 12;
 
 const state = {
   snapshot: null,
   busy: false,
-  archives: [],
-  activeArchiveId: null,
+  activeChats: [],
+  archivedChats: [],
+  currentChatId: null,
+  currentChatStatus: "active",
   currentMessages: [],
   currentRunId: null,
   currentAssistantArticle: null,
@@ -78,14 +81,6 @@ document.querySelector("#app").innerHTML = `
           placeholder="質問を入力..."
         ></textarea>
         <div class="composer-actions">
-          <button id="archiveButton" class="icon-button" type="button" title="アーカイブ" aria-label="アーカイブ">
-            <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
-              <rect x="3" y="4" width="18" height="4" rx="1"></rect>
-              <path d="M5 8v11a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"></path>
-              <path d="M10 13h4"></path>
-            </svg>
-          </button>
-          <span class="composer-spacer"></span>
           <button id="cancelButton" class="icon-button" type="button" disabled title="停止" aria-label="停止">
             <svg class="action-icon stop-icon" aria-hidden="true" viewBox="0 0 24 24">
               <rect x="7" y="7" width="10" height="10" rx="1.5"></rect>
@@ -105,6 +100,10 @@ document.querySelector("#app").innerHTML = `
       <div class="history-head">
         <h2>履歴</h2>
       </div>
+      <button id="newChatButton" class="new-chat-button" type="button">
+        <span aria-hidden="true">＋</span>
+        新しいチャット
+      </button>
       <div id="historyList" class="history-list"></div>
     </aside>
   </div>
@@ -126,17 +125,20 @@ const els = {
   cancelButton: $("#cancelButton"),
   questionForm: $("#questionForm"),
   questionInput: $("#questionInput"),
-  archiveButton: $("#archiveButton"),
+  newChatButton: $("#newChatButton"),
   sendButton: $("#sendButton"),
   toastRegion: $("#toastRegion"),
+  historySidebar: $(".history-sidebar"),
   historyList: $("#historyList"),
 };
 
 init();
 
 async function init() {
-  state.archives = loadArchives();
-  renderArchives();
+  loadChatStore();
+  ensureCurrentChat();
+  renderCurrentMessages();
+  renderChatSidebar();
   wireEvents();
   await listen("task-progress", (event) => {
     renderProgress(event.payload);
@@ -167,9 +169,7 @@ function wireEvents() {
     await invoke("cancel_current_task");
     renderAssistantStatus("停止しています");
   });
-  els.archiveButton.addEventListener("click", () => {
-    archiveCurrentConversation();
-  });
+  els.newChatButton.addEventListener("click", startNewChat);
   els.messages.addEventListener("scroll", () => {
     state.autoScroll = isNearBottom();
     renderJumpButton();
@@ -183,9 +183,15 @@ function wireEvents() {
     await answerQuestion();
   });
   els.historyList.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-archive-id]");
+    const archiveButton = event.target.closest("[data-archive-chat-id]");
+    if (archiveButton) {
+      archiveChat(archiveButton.dataset.archiveChatId);
+      return;
+    }
+
+    const button = event.target.closest("[data-chat-id]");
     if (!button) return;
-    loadArchiveSession(button.dataset.archiveId);
+    loadChatSession(button.dataset.chatId, button.dataset.chatStatus);
   });
 }
 
@@ -288,6 +294,8 @@ async function answerQuestion() {
   if (!question || state.busy) return;
 
   setBusy(true);
+  ensureCurrentChat();
+  promoteCurrentArchivedChat();
   addMessage("user", question);
   els.questionInput.value = "";
 
@@ -321,7 +329,7 @@ async function answerQuestion() {
       failed: false,
     });
     renderAnswerFooter(assistant, state.currentAssistantRaw, performance.now() - answerStartedAt);
-    saveActiveConversation();
+    saveCurrentChat();
     scrollMessages({ force: shouldStick });
   } catch (error) {
     await waitForTypewriterIdle();
@@ -336,7 +344,7 @@ async function answerQuestion() {
       failed: true,
     });
     renderAnswerFooter(assistant, message, performance.now() - answerStartedAt, { failed: true });
-    saveActiveConversation();
+    saveCurrentChat();
     scrollMessages({ force: shouldStick });
   } finally {
     state.currentAssistantArticle = null;
@@ -354,94 +362,206 @@ function selectedDocumentIds() {
   return (state.snapshot?.documents || []).filter((doc) => doc.selected).map((doc) => doc.id);
 }
 
-function clearMessages() {
-  resetTypewriter();
-  state.activeArchiveId = null;
-  state.currentMessages = [];
-  els.messages.innerHTML = `
-    <article class="message assistant">
-      <div class="body markdown-body">
-        <p>資料を選択してインデックスを作成すると、選択中の資料だけを根拠に回答します。</p>
-      </div>
-    </article>
-  `;
-  scrollMessages({ force: true });
-  renderArchives();
-}
+function startNewChat() {
+  if (state.busy) return;
+  saveCurrentChat();
 
-function archiveCurrentConversation() {
-  const saved = saveActiveConversation();
-  if (!saved) {
-    showToast("アーカイブできる会話がありません", "質問と回答がある会話だけ保存できます。", "info");
+  if (state.currentChatStatus === "active" && !state.currentMessages.some((message) => message.text?.trim())) {
+    renderCurrentMessages();
+    renderChatSidebar();
     return;
   }
-  clearMessages();
-  showToast("アーカイブしました", "現在の会話を履歴へ保存しました。", "success");
+
+  const chat = createChatSession([]);
+  state.activeChats = [chat, ...state.activeChats.filter((item) => item.id !== chat.id)].slice(0, 80);
+  selectChat(chat, "active");
+  persistChatStore();
+  renderCurrentMessages();
+  renderChatSidebar();
 }
 
-function saveActiveConversation() {
+function archiveChat(id) {
+  if (state.busy) return;
+  if (state.currentChatStatus === "active" && state.currentChatId === id) {
+    saveCurrentChat();
+  }
+
+  const chat = state.activeChats.find((item) => item.id === id);
+  if (!chat) return;
+
+  state.activeChats = state.activeChats.filter((item) => item.id !== id);
+
+  if (hasConversationMessages(chat)) {
+    const archived = {
+      ...chat,
+      title: buildChatTitle(chat.messages),
+      updatedAt: Date.now(),
+    };
+    state.archivedChats = [archived, ...state.archivedChats.filter((item) => item.id !== id)].slice(0, 80);
+    showToast("アーカイブしました", "", "success");
+  } else {
+    showToast("空のチャットを削除しました", "", "info");
+  }
+
+  if (state.currentChatStatus === "active" && state.currentChatId === id) {
+    const next = state.activeChats[0] || createChatSession([]);
+    if (!state.activeChats.some((item) => item.id === next.id)) {
+      state.activeChats.unshift(next);
+    }
+    selectChat(next, "active");
+    renderCurrentMessages();
+  }
+
+  persistChatStore();
+  renderChatSidebar();
+}
+
+function saveCurrentChat() {
+  const chat = findCurrentChat();
+  if (!chat) return null;
+
   const messages = state.currentMessages
     .filter((message) => message.text && message.text.trim())
     .map((message) => ({ ...message }));
-  if (!messages.length || !messages.some((message) => message.role === "user")) {
-    return null;
-  }
-
   const now = Date.now();
-  const existing = state.activeArchiveId
-    ? state.archives.find((archive) => archive.id === state.activeArchiveId)
-    : null;
-  const archive = {
-    id: existing?.id || createId(),
-    title: buildArchiveTitle(messages),
-    createdAt: existing?.createdAt || now,
-    updatedAt: now,
+  const next = {
+    ...chat,
+    title: buildChatTitle(messages),
+    updatedAt: messages.length ? now : chat.updatedAt,
     messages,
   };
 
-  state.activeArchiveId = archive.id;
-  state.archives = [archive, ...state.archives.filter((item) => item.id !== archive.id)].slice(0, 80);
-  persistArchives();
-  renderArchives();
-  return archive;
+  replaceChat(next, state.currentChatStatus);
+  persistChatStore();
+  renderChatSidebar();
+  return next;
 }
 
-function loadArchiveSession(id) {
+function loadChatSession(id, status) {
   if (state.busy) return;
-  const archive = state.archives.find((item) => item.id === id);
-  if (!archive) return;
-  resetTypewriter();
-  state.activeArchiveId = archive.id;
-  state.currentMessages = archive.messages.map((message) => ({ ...message, id: message.id || createId() }));
+  saveCurrentChat();
+  const chat = findChat(id, status);
+  if (!chat) return;
+  selectChat(chat, status);
   renderCurrentMessages();
-  renderArchives();
-  showToast("履歴を開きました", "この会話の続きとして質問できます。", "info");
+  renderChatSidebar();
 }
 
-function renderArchives() {
-  if (!els.historyList) return;
-  if (!state.archives.length) {
-    els.historyList.innerHTML = `<div class="empty-box">まだ履歴がありません</div>`;
+function promoteCurrentArchivedChat() {
+  if (state.currentChatStatus !== "archived") return;
+  const chat = state.archivedChats.find((item) => item.id === state.currentChatId);
+  if (!chat) {
+    ensureCurrentChat();
     return;
   }
 
-  els.historyList.innerHTML = state.archives
-    .map((archive) => {
-      const active = archive.id === state.activeArchiveId ? " active" : "";
-      return `
-        <button class="history-item${active}" type="button" data-archive-id="${escapeHtml(archive.id)}">
-          <strong>${escapeHtml(archive.title)}</strong>
-          <span>${escapeHtml(formatDateTime(archive.updatedAt))} ・ ${formatNumber(archive.messages.length)}件</span>
+  const active = {
+    ...chat,
+    messages: state.currentMessages.map((message) => ({ ...message })),
+    updatedAt: Date.now(),
+  };
+  state.archivedChats = state.archivedChats.filter((item) => item.id !== chat.id);
+  state.activeChats = [active, ...state.activeChats.filter((item) => item.id !== chat.id)].slice(0, 80);
+  state.currentChatStatus = "active";
+  state.currentChatId = active.id;
+  persistChatStore();
+  renderChatSidebar();
+}
+
+function ensureCurrentChat() {
+  const existing = findCurrentChat();
+  if (existing) {
+    if (!state.currentMessages.length && existing.messages.length) {
+      state.currentMessages = existing.messages.map((message) => ({ ...message }));
+    }
+    return existing;
+  }
+
+  const chat = state.activeChats[0] || createChatSession([]);
+  if (!state.activeChats.some((item) => item.id === chat.id)) {
+    state.activeChats.unshift(chat);
+  }
+  selectChat(chat, "active");
+  return chat;
+}
+
+function selectChat(chat, status) {
+  resetTypewriter();
+  state.currentChatId = chat.id;
+  state.currentChatStatus = status === "archived" ? "archived" : "active";
+  state.currentMessages = chat.messages.map((message) => ({ ...message }));
+  state.autoScroll = true;
+}
+
+function findCurrentChat() {
+  return findChat(state.currentChatId, state.currentChatStatus);
+}
+
+function findChat(id, status) {
+  if (!id) return null;
+  const list = status === "archived" ? state.archivedChats : state.activeChats;
+  return list.find((chat) => chat.id === id) || null;
+}
+
+function replaceChat(chat, status) {
+  const key = status === "archived" ? "archivedChats" : "activeChats";
+  state[key] = state[key].map((item) => (item.id === chat.id ? chat : item));
+}
+
+function renderChatSidebar() {
+  if (!els.historyList) return;
+  els.historyList.innerHTML = `
+    ${renderChatSection("アクティブなチャット", state.activeChats, "active")}
+    ${renderChatSection("アーカイブ済み", state.archivedChats, "archived")}
+  `;
+  updateHistoryDisabledState();
+}
+
+function renderChatSection(title, chats, status) {
+  const visibleChats = chats.filter((chat) => status === "active" || hasConversationMessages(chat));
+  const emptyText = status === "active" ? "アクティブなチャットはありません" : "アーカイブ済みのチャットはありません";
+  return `
+    <section class="history-section">
+      <h3>${escapeHtml(title)}</h3>
+      ${
+        visibleChats.length
+          ? visibleChats.map((chat) => renderChatItem(chat, status)).join("")
+          : `<div class="history-empty">${escapeHtml(emptyText)}</div>`
+      }
+    </section>
+  `;
+}
+
+function renderChatItem(chat, status) {
+  const active = chat.id === state.currentChatId && status === state.currentChatStatus ? " active" : "";
+  const archiveAction =
+    status === "active" && hasConversationMessages(chat)
+      ? `
+        <button class="history-archive-button" type="button" data-archive-chat-id="${escapeHtml(chat.id)}" title="アーカイブ" aria-label="アーカイブ">
+          <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+            <rect x="3" y="4" width="18" height="5" rx="1.5"></rect>
+            <path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9"></path>
+            <path d="M10 13h4"></path>
+          </svg>
         </button>
-      `;
-    })
-    .join("");
+      `
+      : "";
+  return `
+    <div class="history-row${active}">
+      <button class="history-item${active}" type="button" data-chat-id="${escapeHtml(chat.id)}" data-chat-status="${escapeHtml(status)}">
+        <strong>${escapeHtml(chat.title || buildChatTitle(chat.messages))}</strong>
+        <span>${escapeHtml(formatDateTime(chat.updatedAt || chat.createdAt))}</span>
+      </button>
+      ${archiveAction}
+    </div>
+  `;
 }
 
 function renderCurrentMessages() {
+  resetTypewriter();
   els.messages.innerHTML = "";
   if (!state.currentMessages.length) {
-    clearMessages();
+    renderEmptyConversation();
     return;
   }
   for (const message of state.currentMessages) {
@@ -457,27 +577,121 @@ function renderCurrentMessages() {
   scrollMessages({ force: true });
 }
 
-function loadArchives() {
+function renderEmptyConversation() {
+  els.messages.innerHTML = `
+    <article class="message assistant">
+      <div class="body markdown-body">
+        <p>資料を選択してインデックスを作成すると、選択中の資料だけを根拠に回答します。</p>
+      </div>
+    </article>
+  `;
+  scrollMessages({ force: true });
+}
+
+function loadChatStore() {
   try {
-    const raw = localStorage.getItem(ARCHIVE_STORAGE_KEY);
+    const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === "object") {
+      state.activeChats = normalizeChatList(parsed.activeChats);
+      state.archivedChats = normalizeChatList(parsed.archivedChats);
+    } else {
+      state.activeChats = [];
+      state.archivedChats = loadLegacyArchivedChats();
+    }
+  } catch {
+    state.activeChats = [];
+    state.archivedChats = loadLegacyArchivedChats();
+  }
+
+  state.currentChatStatus = "active";
+  state.currentChatId = state.activeChats[0]?.id || null;
+  if (state.currentChatId) {
+    state.currentMessages = state.activeChats[0].messages.map((message) => ({ ...message }));
+  }
+}
+
+function loadLegacyArchivedChats() {
+  try {
+    const raw = localStorage.getItem(LEGACY_ARCHIVE_STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed.filter((item) => item && item.id && Array.isArray(item.messages)) : [];
+    return normalizeChatList(parsed);
   } catch {
     return [];
   }
 }
 
-function persistArchives() {
+function persistChatStore() {
   try {
-    localStorage.setItem(ARCHIVE_STORAGE_KEY, JSON.stringify(state.archives));
+    const payload = {
+      activeChats: state.activeChats.filter(hasConversationMessages).slice(0, 80),
+      archivedChats: state.archivedChats.filter(hasConversationMessages).slice(0, 80),
+    };
+    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(payload));
   } catch (error) {
     showToast("履歴の保存に失敗しました", String(error), "error");
   }
 }
 
-function buildArchiveTitle(messages) {
+function normalizeChatList(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  return value
+    .map(normalizeChatSession)
+    .filter((chat) => {
+      if (!chat || seen.has(chat.id)) return false;
+      seen.add(chat.id);
+      return true;
+    })
+    .slice(0, 80);
+}
+
+function normalizeChatSession(value) {
+  if (!value || typeof value !== "object") return null;
+  const now = Date.now();
+  const messages = Array.isArray(value.messages) ? value.messages.map(normalizeMessage).filter(Boolean) : [];
+  const chat = {
+    id: String(value.id || createId()),
+    title: typeof value.title === "string" && value.title.trim() ? value.title.trim() : buildChatTitle(messages),
+    createdAt: Number(value.createdAt) || now,
+    updatedAt: Number(value.updatedAt) || Number(value.createdAt) || now,
+    messages,
+  };
+  return chat;
+}
+
+function normalizeMessage(value) {
+  if (!value || typeof value !== "object") return null;
+  const text = String(value.text || "");
+  if (!text.trim()) return null;
+  return {
+    id: String(value.id || createId()),
+    role: value.role === "assistant" ? "assistant" : "user",
+    text,
+    createdAt: Number(value.createdAt) || Date.now(),
+    elapsedMs: Number.isFinite(Number(value.elapsedMs)) ? Number(value.elapsedMs) : null,
+    failed: Boolean(value.failed),
+  };
+}
+
+function createChatSession(messages) {
+  const now = Date.now();
+  return {
+    id: createId(),
+    title: buildChatTitle(messages),
+    createdAt: now,
+    updatedAt: now,
+    messages: messages.map((message) => ({ ...message })),
+  };
+}
+
+function hasConversationMessages(chat) {
+  return Boolean(chat?.messages?.some((message) => message.text && message.text.trim()));
+}
+
+function buildChatTitle(messages) {
   const firstUser = messages.find((message) => message.role === "user" && message.text.trim());
-  const title = firstUser?.text.trim().replace(/\s+/g, " ") || "無題の会話";
+  const title = firstUser?.text.trim().replace(/\s+/g, " ") || "新しいチャット";
   return title.length > 34 ? `${title.slice(0, 34)}...` : title;
 }
 
@@ -725,16 +939,25 @@ function resolveTypewriterWaiters() {
 function setBusy(busy) {
   state.busy = busy;
   els.sidebar.classList.toggle("is-locked", busy);
+  els.historySidebar.classList.toggle("is-locked", busy);
   els.chooseSourceButton.disabled = busy;
   els.indexButton.disabled = busy;
   els.selectAllButton.disabled = busy;
   els.clearSelectionButton.disabled = busy;
-  els.archiveButton.disabled = busy;
+  els.newChatButton.disabled = busy;
   els.sendButton.disabled = busy;
   els.cancelButton.disabled = !busy;
   els.questionInput.disabled = busy;
   els.fileList.querySelectorAll("input[type='checkbox']").forEach((input) => {
     input.disabled = busy;
+  });
+  updateHistoryDisabledState();
+}
+
+function updateHistoryDisabledState() {
+  if (!els.historyList) return;
+  els.historyList.querySelectorAll("button").forEach((button) => {
+    button.disabled = state.busy;
   });
 }
 

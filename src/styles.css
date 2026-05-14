@@ -156,6 +156,10 @@ button.primary {
   background: #f2f5f7;
 }
 
+.history-sidebar.is-locked {
+  opacity: 0.78;
+}
+
 .history-head {
   display: flex;
   align-items: center;
@@ -169,9 +173,44 @@ button.primary {
   letter-spacing: 0;
 }
 
+.new-chat-button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  margin-bottom: 14px;
+  border-color: #126b61;
+  background: #126b61;
+  color: #ffffff;
+  font-weight: 650;
+}
+
+.new-chat-button span {
+  font-size: 17px;
+  line-height: 1;
+}
+
 .history-list {
   display: grid;
+  gap: 16px;
+}
+
+.history-section {
+  display: grid;
   gap: 8px;
+}
+
+.history-section h3 {
+  margin: 0;
+  color: #667582;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.history-row {
+  position: relative;
 }
 
 .history-item {
@@ -183,6 +222,10 @@ button.primary {
   padding: 9px;
   background: #ffffff;
   text-align: left;
+}
+
+.history-row .history-item {
+  padding-right: 40px;
 }
 
 .history-item.active {
@@ -200,6 +243,47 @@ button.primary {
 
 .history-item span {
   color: #667582;
+  font-size: 12px;
+}
+
+.history-archive-button {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-color: transparent;
+  padding: 0;
+  background: transparent;
+  color: #4d5c68;
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: opacity 120ms ease;
+}
+
+.history-row:hover .history-archive-button,
+.history-archive-button:focus-visible {
+  opacity: 1;
+}
+
+.history-archive-button:hover:not(:disabled) {
+  border-color: #cbd5dc;
+  background: #ffffff;
+}
+
+.history-archive-button .action-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.history-empty {
+  color: #667582;
+  border: 1px dashed #cbd5dc;
+  border-radius: 6px;
+  padding: 10px;
+  background: #ffffff;
   font-size: 12px;
 }
 
@@ -452,10 +536,6 @@ button.primary {
 .composer-actions {
   justify-content: flex-end;
   margin-top: 8px;
-}
-
-.composer-spacer {
-  flex: 1;
 }
 
 .thinking {
