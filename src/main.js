@@ -509,8 +509,7 @@ async function saveApiKey(event) {
     };
     els.apiKeyInput.value = "";
     setApiKeyVisibility(false);
-    setApiKeyStatus(`保存しました: ${settings.apiKeyHint || "保存済み"}`, "success");
-    showToast("APIキーを保存しました", "", "success");
+    setApiKeyStatus("保存しました", "success");
   } catch (error) {
     setApiKeyStatus(`保存に失敗しました: ${String(error)}`, "error");
     showToast("APIキーの保存に失敗しました", String(error), "error");
@@ -535,8 +534,7 @@ async function clearApiKey() {
     };
     els.apiKeyInput.value = "";
     setApiKeyVisibility(false);
-    setApiKeyStatus("APIキーを削除しました。", "success");
-    showToast("APIキーを削除しました", "", "success");
+    setApiKeyStatus("削除しました", "success");
   } catch (error) {
     setApiKeyStatus(`削除に失敗しました: ${String(error)}`, "error");
     showToast("APIキーの削除に失敗しました", String(error), "error");
