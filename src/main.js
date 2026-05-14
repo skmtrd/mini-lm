@@ -27,54 +27,12 @@ document.querySelector("#app").innerHTML = `
       <section class="panel">
         <div class="panel-title">
           <h2>DeepSeek</h2>
-          <button id="saveSettingsButton" class="icon-text" type="button">保存</button>
         </div>
-        <label class="field">
-          <span>API key</span>
-          <input id="apiKeyInput" type="password" autocomplete="off" placeholder="保存済みなら空欄でOK" />
-        </label>
-        <div class="split-actions">
-          <button id="clearApiKeyButton" type="button">キー削除</button>
+        <div class="simple-status">
           <span id="apiKeyStatus" class="muted">未確認</span>
+          <strong>自動設定で使用します</strong>
         </div>
-        <label class="field">
-          <span>Model</span>
-          <select id="modelInput">
-            <option value="deepseek-v4-flash">deepseek-v4-flash</option>
-            <option value="deepseek-v4-pro">deepseek-v4-pro</option>
-          </select>
-        </label>
-        <div class="two-cols">
-          <label class="field">
-            <span>Thinking</span>
-            <select id="thinkingInput">
-              <option value="false">disabled</option>
-              <option value="true">enabled</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>Reasoning</span>
-            <select id="reasoningInput">
-              <option value="high">high</option>
-              <option value="max">max</option>
-            </select>
-          </label>
-        </div>
-        <div class="two-cols">
-          <label class="field">
-            <span>Temperature</span>
-            <input id="temperatureInput" type="number" min="0" max="1" step="0.1" value="0.1" />
-          </label>
-          <label class="field">
-            <span>Context chars</span>
-            <input id="contextCharsInput" type="number" min="3000" max="80000" step="1000" value="12000" />
-          </label>
-        </div>
-        <label class="field">
-          <span>Comprehensive batch chars</span>
-          <input id="batchCharsInput" type="number" min="2000" max="16000" step="500" value="6000" />
-        </label>
-        <p id="apiStorageWarning" class="warning">APIキーはOSのKeychain/Credential Managerへ保存します。</p>
+        <p id="apiStorageWarning" class="warning">APIキーを確認しています。</p>
       </section>
 
       <section class="panel source-panel">
@@ -152,17 +110,8 @@ const $ = (selector) => document.querySelector(selector);
 
 const els = {
   appStateBadge: $("#appStateBadge"),
-  apiKeyInput: $("#apiKeyInput"),
   apiKeyStatus: $("#apiKeyStatus"),
   apiStorageWarning: $("#apiStorageWarning"),
-  modelInput: $("#modelInput"),
-  thinkingInput: $("#thinkingInput"),
-  reasoningInput: $("#reasoningInput"),
-  temperatureInput: $("#temperatureInput"),
-  contextCharsInput: $("#contextCharsInput"),
-  batchCharsInput: $("#batchCharsInput"),
-  saveSettingsButton: $("#saveSettingsButton"),
-  clearApiKeyButton: $("#clearApiKeyButton"),
   chooseSourceButton: $("#chooseSourceButton"),
   sourcePath: $("#sourcePath"),
   indexButton: $("#indexButton"),
@@ -202,8 +151,6 @@ async function init() {
 }
 
 function wireEvents() {
-  els.saveSettingsButton.addEventListener("click", () => saveSettings(false));
-  els.clearApiKeyButton.addEventListener("click", () => saveSettings(true));
   els.chooseSourceButton.addEventListener("click", chooseSourceDirectory);
   els.indexButton.addEventListener("click", indexSource);
   els.selectAllButton.addEventListener("click", async () => {
@@ -238,12 +185,6 @@ function renderSnapshot() {
   const { settings, documents, stats } = state.snapshot;
   els.appStateBadge.textContent = documents.length ? "読込済み" : "未読込";
   renderApiKeyStatus(settings);
-  els.modelInput.value = settings.model || "deepseek-v4-flash";
-  els.thinkingInput.value = String(Boolean(settings.thinkingEnabled));
-  els.reasoningInput.value = settings.reasoningEffort || "high";
-  els.temperatureInput.value = settings.temperature ?? 0.1;
-  els.contextCharsInput.value = settings.maxContextChars ?? 12000;
-  els.batchCharsInput.value = settings.comprehensiveBatchChars ?? 6000;
   els.sourcePath.textContent = settings.sourcePath || "未設定";
   renderStats(stats);
   renderFileList(documents);
@@ -264,7 +205,7 @@ function renderApiKeyStatus(settings) {
     return;
   }
 
-  if (settings.apiKeyStorage === "sqlite-plaintext-fallback") {
+  if (settings.apiKeyStorage?.startsWith("sqlite-plaintext")) {
     els.apiKeyStatus.textContent = "APIキー保存済み（平文フォールバック）";
     els.apiStorageWarning.textContent =
       "OSの安全領域に保存できなかったため、SQLiteに平文で保存しています。この端末内だけで使ってください。";
@@ -329,23 +270,6 @@ async function chooseSourceDirectory() {
   if (!selected) return;
   state.snapshot = await invoke("set_source_directory", { path: selected });
   renderSnapshot();
-}
-
-async function saveSettings(clearApiKey) {
-  const update = {
-    model: els.modelInput.value,
-    thinkingEnabled: els.thinkingInput.value === "true",
-    reasoningEffort: els.reasoningInput.value,
-    temperature: Number(els.temperatureInput.value || 0.1),
-    maxContextChars: Number(els.contextCharsInput.value || 12000),
-    comprehensiveBatchChars: Number(els.batchCharsInput.value || 6000),
-    apiKey: clearApiKey ? null : els.apiKeyInput.value.trim() || null,
-    clearApiKey,
-  };
-  await invoke("save_settings", { update });
-  els.apiKeyInput.value = "";
-  await refreshSnapshot();
-  setStatus("設定保存", clearApiKey ? "APIキーを削除しました" : "設定を保存しました", false);
 }
 
 async function indexSource() {
@@ -502,7 +426,6 @@ function setBusy(busy) {
   els.indexButton.disabled = busy;
   els.sendButton.disabled = busy;
   els.searchOnlyButton.disabled = busy;
-  els.saveSettingsButton.disabled = busy;
 }
 
 function setStatus(title, detail, canCancel, tone = "idle") {

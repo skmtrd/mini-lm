@@ -94,7 +94,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## DeepSeek
 
-既定モデルは `deepseek-v4-flash` です。設定画面で `deepseek-v4-pro` も選べます。
+既定モデルは `deepseek-v4-flash` です。通常利用で迷わないよう、モデル、thinking、reasoning effort、temperatureなどの詳細設定はUIに出していません。
 
 DeepSeek APIはOpenAI互換形式の `/chat/completions` を使います。API keyはOSの安全な保存領域へ保存します。OS Keychain / Credential Managerが使えない環境では、アプリがSQLite平文フォールバックへ切り替え、画面に警告を表示します。ログにはAPI keyを保存しません。
 

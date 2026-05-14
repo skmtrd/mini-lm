@@ -163,6 +163,20 @@ textarea {
   font-size: 12px;
 }
 
+.simple-status {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #d9e0e5;
+  border-radius: 6px;
+  padding: 10px;
+  margin-top: 10px;
+  background: #f7f9fa;
+}
+
+.simple-status strong {
+  font-size: 13px;
+}
+
 .ok-text {
   color: #0f766e;
 }

@@ -1978,18 +1978,7 @@ async fn call_deepseek(
         .filter(|key| !key.trim().is_empty())
         .ok_or_else(|| "DeepSeek API key が未設定です。設定画面で保存してください。".to_string())?;
     let client = reqwest::Client::new();
-    let mut body = json!({
-        "model": settings.model,
-        "messages": messages,
-        "temperature": settings.temperature,
-        "max_tokens": max_tokens,
-        "stream": stream,
-        "thinking": {"type": if settings.thinking_enabled { "enabled" } else { "disabled" }},
-        "reasoning_effort": settings.reasoning_effort
-    });
-    if json_mode {
-        body["response_format"] = json!({"type": "json_object"});
-    }
+    let body = build_deepseek_body(settings, messages, max_tokens, json_mode, stream);
 
     let mut attempt = 0usize;
     loop {
@@ -2051,6 +2040,35 @@ async fn call_deepseek(
         );
         return Err(format!("{}: {}", failure.class_name, failure.message));
     }
+}
+
+fn build_deepseek_body(
+    settings: &Settings,
+    messages: Vec<JsonValue>,
+    max_tokens: u32,
+    json_mode: bool,
+    stream: bool,
+) -> JsonValue {
+    let mut body = json!({
+        "model": settings.model,
+        "messages": messages,
+        "temperature": settings.temperature,
+        "max_tokens": max_tokens,
+        "stream": stream,
+        "thinking": {
+            "type": if settings.thinking_enabled { "enabled" } else { "disabled" }
+        }
+    });
+
+    if settings.thinking_enabled {
+        body["reasoning_effort"] = json!(settings.reasoning_effort);
+    }
+
+    if json_mode {
+        body["response_format"] = json!({"type": "json_object"});
+    }
+
+    body
 }
 
 async fn read_deepseek_stream(
@@ -2263,11 +2281,21 @@ fn load_settings(conn: &Connection) -> Result<Settings, String> {
     if let Some(value) = get_setting(conn, "comprehensive_batch_chars")? {
         settings.comprehensive_batch_chars = value.parse().unwrap_or(settings.comprehensive_batch_chars);
     }
+    apply_simple_defaults(&mut settings);
     let (api_key, api_key_storage) = load_api_key(conn);
     settings.api_key_saved = api_key.is_some();
     settings.api_key_storage = api_key_storage;
     settings.api_key = api_key;
     Ok(settings)
+}
+
+fn apply_simple_defaults(settings: &mut Settings) {
+    settings.model = DEFAULT_MODEL.to_string();
+    settings.thinking_enabled = false;
+    settings.reasoning_effort = "high".to_string();
+    settings.temperature = 0.1;
+    settings.max_context_chars = DEFAULT_CONTEXT_CHARS;
+    settings.comprehensive_batch_chars = DEFAULT_BATCH_CHARS;
 }
 
 fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
@@ -2694,5 +2722,44 @@ mod tests {
         assert!(!response.hits.is_empty());
         assert!(response.hits[0].snippet.contains("扶養手当"));
         assert!(response.hits[0].ngram_score > 0.0 || response.hits[0].vector_score > 0.0);
+    }
+
+    #[test]
+    fn deepseek_body_omits_reasoning_effort_when_thinking_is_disabled() {
+        let settings = Settings {
+            thinking_enabled: false,
+            reasoning_effort: "high".to_string(),
+            ..Settings::default()
+        };
+        let body = build_deepseek_body(
+            &settings,
+            vec![json!({"role": "user", "content": "test"})],
+            100,
+            false,
+            false,
+        );
+
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn deepseek_body_sets_reasoning_effort_when_thinking_is_enabled() {
+        let settings = Settings {
+            thinking_enabled: true,
+            reasoning_effort: "max".to_string(),
+            ..Settings::default()
+        };
+        let body = build_deepseek_body(
+            &settings,
+            vec![json!({"role": "user", "content": "test"})],
+            100,
+            true,
+            true,
+        );
+
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "max");
+        assert_eq!(body["response_format"]["type"], "json_object");
     }
 }
