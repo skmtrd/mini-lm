@@ -931,7 +931,7 @@ async fn answer_comprehensively(
         load_selected_chunks(&conn, &request.selected_document_ids)?
     };
     enrich_profile_with_source_concepts(&mut profile, &chunks, &request.question);
-    let seed_hits = {
+    let mut seed_hits = {
         let conn = state.conn()?;
         let corrected =
             corrective_retrieval_internal(&conn, &request.question, &request.selected_document_ids, &profile, seed_hits)?;
@@ -995,9 +995,76 @@ async fn answer_comprehensively(
 
         let conn = state.conn()?;
         for fact in extracted {
-            insert_fact(&conn, run_id, &fact)?;
-            facts.push(fact);
+            if push_unique_fact(&mut facts, fact.clone()) {
+                insert_fact(&conn, run_id, &fact)?;
+            }
         }
+    }
+
+    let followup_queries = derive_followup_queries_from_facts(&facts, &profile);
+    if !followup_queries.is_empty() {
+        emit_progress(
+            app,
+            started,
+            "extract",
+            "running",
+            "抽出事実から追加検索し、関係箇所を再確認しています",
+            Some(run_id.to_string()),
+            total_batches,
+            total_batches,
+            true,
+        );
+        profile.terms.extend(followup_queries.clone());
+        normalize_string_list(&mut profile.terms);
+        let followup_hits = {
+            let conn = state.conn()?;
+            fact_guided_retrieval_internal(&conn, &request.selected_document_ids, &followup_queries)?
+        };
+        merge_search_hits(&mut seed_hits, followup_hits.clone(), 48);
+        let focused_chunks = focused_chunks_from_hits(&chunks, &followup_hits, 96);
+        let focused_batches = build_chunk_batches(&focused_chunks, settings.comprehensive_batch_chars);
+        for (idx, batch) in focused_batches.iter().enumerate() {
+            if cancel.load(AtomicOrdering::SeqCst) {
+                let conn = state.conn()?;
+                complete_run(&conn, run_id, "cancelled", Some("ユーザーがキャンセルしました"))?;
+                emit_progress(
+                    app,
+                    started,
+                    "extract",
+                    "cancelled",
+                    "追加抽出をキャンセルしました",
+                    Some(run_id.to_string()),
+                    idx as u64,
+                    focused_batches.len() as u64,
+                    false,
+                );
+                return Err("追加抽出をキャンセルしました。".to_string());
+            }
+            let extracted = extract_facts_from_batch(
+                app,
+                settings,
+                &request.question,
+                &profile,
+                &hierarchy,
+                batch,
+                run_id,
+                cancel,
+            )
+            .await?;
+            let conn = state.conn()?;
+            for fact in extracted {
+                if push_unique_fact(&mut facts, fact.clone()) {
+                    insert_fact(&conn, run_id, &fact)?;
+                }
+            }
+        }
+        let conn = state.conn()?;
+        let hits_json = serde_json::to_string(&seed_hits).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "UPDATE retrieval_runs SET hits_json = ?1 WHERE id = ?2",
+            params![hits_json, run_id],
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     emit_progress(
@@ -2332,6 +2399,132 @@ fn corrective_retrieval_internal(
     diversify_hits(&mut hits, 32);
     hits.truncate(32);
     Ok(hits)
+}
+
+fn derive_followup_queries_from_facts(facts: &[ExtractedFact], profile: &QuestionProfile) -> Vec<String> {
+    let existing = profile.search_terms().into_iter().collect::<HashSet<_>>();
+    let mut queries = Vec::new();
+    for fact in facts.iter().take(120) {
+        for field in [
+            fact.object.as_str(),
+            fact.subject.as_str(),
+            fact.condition.as_str(),
+            fact.effect.as_str(),
+            fact.exception.as_str(),
+        ] {
+            for term in extract_terms(field) {
+                if term.chars().count() >= 2 && !is_stop_term(&term) && !existing.contains(&term) {
+                    queries.push(term);
+                }
+            }
+        }
+        let object = fact.object.trim();
+        let condition = fact.condition.trim();
+        let effect = fact.effect.trim();
+        if !object.is_empty() && !condition.is_empty() {
+            queries.push(format!("{} {}", object, first_chars(condition, 40)));
+        }
+        if !object.is_empty() && !effect.is_empty() {
+            queries.push(format!("{} {}", object, first_chars(effect, 40)));
+        }
+    }
+    normalize_string_list(&mut queries);
+    queries.truncate(40);
+    queries
+}
+
+fn fact_guided_retrieval_internal(
+    conn: &Connection,
+    selected_document_ids: &[i64],
+    queries: &[String],
+) -> Result<Vec<SearchHit>, String> {
+    let mut merged = Vec::new();
+    for query in queries.iter().take(40) {
+        let response = hybrid_search_internal(conn, query, selected_document_ids, 6)?;
+        merge_search_hits(&mut merged, response.hits, 64);
+    }
+    Ok(merged)
+}
+
+fn merge_search_hits(base: &mut Vec<SearchHit>, incoming: Vec<SearchHit>, limit: usize) {
+    let mut by_id = base
+        .drain(..)
+        .map(|hit| (hit.chunk_id, hit))
+        .collect::<HashMap<_, _>>();
+    for hit in incoming {
+        match by_id.get_mut(&hit.chunk_id) {
+            Some(existing) => {
+                existing.score = existing.score.max(hit.score) + 0.01;
+                existing.debug = format!("{} fact_guided", existing.debug);
+            }
+            None => {
+                by_id.insert(hit.chunk_id, hit);
+            }
+        }
+    }
+    let mut hits = by_id.into_values().collect::<Vec<_>>();
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    diversify_hits(&mut hits, limit);
+    hits.truncate(limit);
+    *base = hits;
+}
+
+fn focused_chunks_from_hits(chunks: &[ChunkRecord], hits: &[SearchHit], max_chunks: usize) -> Vec<ChunkRecord> {
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let by_id = chunks.iter().map(|chunk| (chunk.id, chunk)).collect::<HashMap<_, _>>();
+    let mut selected_ids = Vec::new();
+    for hit in hits {
+        if let Some(chunk) = by_id.get(&hit.chunk_id) {
+            if let Some(prev) = chunk.prev_chunk_id {
+                selected_ids.push(prev);
+            }
+            selected_ids.push(chunk.id);
+            if let Some(next) = chunk.next_chunk_id {
+                selected_ids.push(next);
+            }
+            for sibling in chunks
+                .iter()
+                .filter(|candidate| {
+                    candidate.document_id == chunk.document_id
+                        && !chunk.heading_path.is_empty()
+                        && candidate.heading_path == chunk.heading_path
+                })
+                .take(4)
+            {
+                selected_ids.push(sibling.id);
+            }
+        }
+    }
+    selected_ids.sort_unstable();
+    selected_ids.dedup();
+    selected_ids
+        .into_iter()
+        .filter_map(|id| by_id.get(&id).map(|chunk| (*chunk).clone()))
+        .take(max_chunks)
+        .collect()
+}
+
+fn push_unique_fact(facts: &mut Vec<ExtractedFact>, fact: ExtractedFact) -> bool {
+    let key = fact_identity(&fact);
+    if facts.iter().any(|existing| fact_identity(existing) == key) {
+        return false;
+    }
+    facts.push(fact);
+    true
+}
+
+fn fact_identity(fact: &ExtractedFact) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        fact.chunk_id,
+        fact.scope.trim(),
+        fact.subject.trim(),
+        fact.object.trim(),
+        fact.condition.trim(),
+        fact.effect.trim()
+    )
 }
 
 fn enrich_profile_with_source_concepts(profile: &mut QuestionProfile, chunks: &[ChunkRecord], question: &str) {
@@ -3996,5 +4189,58 @@ mod tests {
         assert!(statement.contains("object=扶養手当"));
         assert!(statement.contains("condition=扶養親族を有する場合"));
         assert!(statement.contains("effect=支給する"));
+    }
+
+    #[test]
+    fn fact_fields_generate_followup_queries_for_second_pass() {
+        let facts = vec![ExtractedFact {
+            chunk_id: 1,
+            file_name: "rules.txt".to_string(),
+            path: "/tmp/rules.txt".to_string(),
+            heading_path: "第1条 扶養手当".to_string(),
+            char_start: 0,
+            char_end: 10,
+            statement: "扶養手当は扶養親族を有する職員に支給する。".to_string(),
+            scope: "給与規程".to_string(),
+            subject: "職員".to_string(),
+            object: "扶養手当".to_string(),
+            condition: "扶養親族を有する場合".to_string(),
+            effect: "支給する".to_string(),
+            exception: "".to_string(),
+            polarity: "conditional".to_string(),
+            quote: "扶養親族を有する職員に支給する".to_string(),
+            confidence: "high".to_string(),
+        }];
+        let profile = QuestionProfile::from_question("手当はどうなっていますか");
+        let queries = derive_followup_queries_from_facts(&facts, &profile);
+
+        assert!(queries.iter().any(|query| query.contains("扶養親族")));
+        assert!(queries.iter().any(|query| query.contains("扶養手当")));
+    }
+
+    #[test]
+    fn push_unique_fact_deduplicates_same_relationship() {
+        let fact = ExtractedFact {
+            chunk_id: 1,
+            file_name: "rules.txt".to_string(),
+            path: "/tmp/rules.txt".to_string(),
+            heading_path: "第1条 扶養手当".to_string(),
+            char_start: 0,
+            char_end: 10,
+            statement: "扶養手当は支給する。".to_string(),
+            scope: "給与規程".to_string(),
+            subject: "職員".to_string(),
+            object: "扶養手当".to_string(),
+            condition: "扶養親族を有する場合".to_string(),
+            effect: "支給する".to_string(),
+            exception: "".to_string(),
+            polarity: "conditional".to_string(),
+            quote: "支給する".to_string(),
+            confidence: "high".to_string(),
+        };
+        let mut facts = Vec::new();
+        assert!(push_unique_fact(&mut facts, fact.clone()));
+        assert!(!push_unique_fact(&mut facts, fact));
+        assert_eq!(facts.len(), 1);
     }
 }
