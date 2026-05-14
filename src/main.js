@@ -136,7 +136,6 @@ init();
 
 async function init() {
   loadChatStore();
-  ensureCurrentChat();
   renderCurrentMessages();
   renderChatSidebar();
   wireEvents();
@@ -294,9 +293,9 @@ async function answerQuestion() {
   if (!question || state.busy) return;
 
   setBusy(true);
-  ensureCurrentChat();
   promoteCurrentArchivedChat();
   addMessage("user", question);
+  saveCurrentChat();
   els.questionInput.value = "";
 
   const answerStartedAt = performance.now();
@@ -365,17 +364,7 @@ function selectedDocumentIds() {
 function startNewChat() {
   if (state.busy) return;
   saveCurrentChat();
-
-  if (state.currentChatStatus === "active" && !state.currentMessages.some((message) => message.text?.trim())) {
-    renderCurrentMessages();
-    renderChatSidebar();
-    return;
-  }
-
-  const chat = createChatSession([]);
-  state.activeChats = [chat, ...state.activeChats.filter((item) => item.id !== chat.id)].slice(0, 80);
-  selectChat(chat, "active");
-  persistChatStore();
+  selectDraftChat();
   renderCurrentMessages();
   renderChatSidebar();
 }
@@ -404,11 +393,12 @@ function archiveChat(id) {
   }
 
   if (state.currentChatStatus === "active" && state.currentChatId === id) {
-    const next = state.activeChats[0] || createChatSession([]);
-    if (!state.activeChats.some((item) => item.id === next.id)) {
-      state.activeChats.unshift(next);
+    const next = state.activeChats[0];
+    if (next) {
+      selectChat(next, "active");
+    } else {
+      selectDraftChat();
     }
-    selectChat(next, "active");
     renderCurrentMessages();
   }
 
@@ -417,12 +407,19 @@ function archiveChat(id) {
 }
 
 function saveCurrentChat() {
-  const chat = findCurrentChat();
-  if (!chat) return null;
-
   const messages = state.currentMessages
     .filter((message) => message.text && message.text.trim())
     .map((message) => ({ ...message }));
+  if (!messages.length) return null;
+
+  let chat = findCurrentChat();
+  if (!chat) {
+    chat = createChatSession([]);
+    state.currentChatId = chat.id;
+    state.currentChatStatus = "active";
+    state.activeChats = [chat, ...state.activeChats.filter((item) => item.id !== chat.id)].slice(0, 80);
+  }
+
   const now = Date.now();
   const next = {
     ...chat,
@@ -477,11 +474,15 @@ function ensureCurrentChat() {
     return existing;
   }
 
-  const chat = state.activeChats[0] || createChatSession([]);
-  if (!state.activeChats.some((item) => item.id === chat.id)) {
-    state.activeChats.unshift(chat);
+  if (!state.currentMessages.some((message) => message.text && message.text.trim())) {
+    selectDraftChat();
+    return null;
   }
-  selectChat(chat, "active");
+
+  const chat = createChatSession(state.currentMessages);
+  state.activeChats = [chat, ...state.activeChats.filter((item) => item.id !== chat.id)].slice(0, 80);
+  state.currentChatId = chat.id;
+  state.currentChatStatus = "active";
   return chat;
 }
 
@@ -490,6 +491,14 @@ function selectChat(chat, status) {
   state.currentChatId = chat.id;
   state.currentChatStatus = status === "archived" ? "archived" : "active";
   state.currentMessages = chat.messages.map((message) => ({ ...message }));
+  state.autoScroll = true;
+}
+
+function selectDraftChat() {
+  resetTypewriter();
+  state.currentChatId = null;
+  state.currentChatStatus = "active";
+  state.currentMessages = [];
   state.autoScroll = true;
 }
 
@@ -518,7 +527,7 @@ function renderChatSidebar() {
 }
 
 function renderChatSection(title, chats, status) {
-  const visibleChats = chats.filter((chat) => status === "active" || hasConversationMessages(chat));
+  const visibleChats = chats.filter(hasConversationMessages);
   const emptyText = status === "active" ? "アクティブなチャットはありません" : "アーカイブ済みのチャットはありません";
   return `
     <section class="history-section">
