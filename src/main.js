@@ -44,8 +44,11 @@ document.querySelector("#app").innerHTML = `
     <div class="window-drag-region" data-tauri-drag-region></div>
     <aside class="sidebar source-sidebar">
       <section class="source-panel">
-        <div class="source-toolbar">
-          <span class="source-kicker">資料</span>
+        <div class="source-header">
+          <div class="source-title-group">
+            <span class="source-kicker">資料</span>
+            <div id="stats" class="stats compact"></div>
+          </div>
           <div class="source-tool-buttons">
             <button id="chooseSourceButton" class="source-icon-button" type="button" title="フォルダ選択" aria-label="フォルダ選択">
               <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
@@ -64,7 +67,6 @@ document.querySelector("#app").innerHTML = `
         </div>
         <div id="sourcePath" class="path-box">未設定</div>
         <div class="source-list-head">
-          <div id="stats" class="stats compact"></div>
           <div class="source-selection-actions">
             <button id="selectAllButton" class="text-button" type="button">全選択</button>
             <button id="clearSelectionButton" class="text-button" type="button">解除</button>
@@ -72,13 +74,15 @@ document.querySelector("#app").innerHTML = `
         </div>
         <div id="fileList" class="file-list"></div>
       </section>
-      <button id="settingsButton" class="settings-button" type="button" title="設定" aria-label="設定">
-        <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
-          <path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5z"></path>
-          <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1A2 2 0 0 1 4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.3 7A2 2 0 0 1 7.1 4.2l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1A2 2 0 0 1 19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1a2 2 0 0 1 0 4H21a1.7 1.7 0 0 0-1.6 1z"></path>
-        </svg>
-        <span>設定</span>
-      </button>
+      <div class="source-footer">
+        <button id="settingsButton" class="settings-button" type="button" title="設定" aria-label="設定">
+          <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+            <path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5z"></path>
+            <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1A2 2 0 0 1 4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.3 7A2 2 0 0 1 7.1 4.2l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1A2 2 0 0 1 19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1a2 2 0 0 1 0 4H21a1.7 1.7 0 0 0-1.6 1z"></path>
+          </svg>
+          <span>設定</span>
+        </button>
+      </div>
     </aside>
 
     <main class="main">
@@ -285,6 +289,7 @@ async function refreshSnapshot() {
 function renderSnapshot() {
   const { settings, documents, stats } = state.snapshot;
   els.sourcePath.textContent = settings.sourcePath || "未設定";
+  els.sourcePath.title = settings.sourcePath || "";
   renderStats(stats);
   renderFileList(documents);
   renderApiKeyStatus();
