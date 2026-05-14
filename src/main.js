@@ -742,12 +742,15 @@ function shouldAutoScroll() {
 
 function isNearBottom() {
   if (!canScrollMessages()) return true;
-  const distance = els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight;
-  return distance < 96;
+  return distanceFromBottom() <= 4;
 }
 
 function canScrollMessages() {
   return els.messages.scrollHeight > els.messages.clientHeight + 2;
+}
+
+function distanceFromBottom() {
+  return Math.max(0, els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight);
 }
 
 function scrollMessages(options = {}) {
@@ -759,7 +762,7 @@ function scrollMessages(options = {}) {
 }
 
 function renderJumpButton() {
-  const show = canScrollMessages() && !isNearBottom();
+  const show = canScrollMessages() && distanceFromBottom() > 4;
   els.jumpToLatestButton.hidden = !show;
 }
 
