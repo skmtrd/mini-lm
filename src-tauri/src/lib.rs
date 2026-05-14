@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -27,7 +27,6 @@ const EMBEDDING_DIMS: usize = 384;
 const DEFAULT_CONTEXT_CHARS: usize = 12_000;
 const DEFAULT_BATCH_CHARS: usize = 6_000;
 const MAX_EXTRACT_CONCURRENCY: usize = 5;
-const EXTRACT_BATCH_TIMEOUT_SECS: u64 = 45;
 const MAX_REDUCED_FACTS: usize = 120;
 const MAX_SHORT_RATE_WAIT_MS: u64 = 15_000;
 const ALLOWED_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "csv", "tsv", "json", "log", "text"];
@@ -1182,6 +1181,17 @@ async fn answer_comprehensively(
         cancel,
     )
     .await?;
+    emit_progress(
+        app,
+        started,
+        "audit",
+        "running",
+        "回答の根拠を監査しています",
+        Some(run_id.to_string()),
+        total_batches,
+        total_batches,
+        true,
+    );
     let mut audit = audit_facts_answer(
         app,
         settings,
@@ -1220,6 +1230,17 @@ async fn answer_comprehensively(
             .await
             {
                 answer = revised;
+                emit_progress(
+                    app,
+                    started,
+                    "audit",
+                    "running",
+                    "修正後の回答を再監査しています",
+                    Some(run_id.to_string()),
+                    total_batches,
+                    total_batches,
+                    true,
+                );
                 let revised_audit = audit_facts_answer(
                     app,
                     settings,
@@ -1235,6 +1256,19 @@ async fn answer_comprehensively(
             }
         }
     }
+
+    emit_progress(
+        app,
+        started,
+        "answer",
+        "running",
+        "監査済みの最終回答を表示しています",
+        Some(run_id.to_string()),
+        total_batches,
+        total_batches,
+        true,
+    );
+    emit_answer_chunks(app, run_id, &answer).await;
 
     let conn = state.conn()?;
     save_answer(&conn, run_id, &answer, audit.as_deref())?;
@@ -2762,21 +2796,10 @@ async fn extract_fact_batches(
                     run_id, batch_no, total, concurrency_snapshot, batch_chunks, batch_chars
                 ));
                 let batch_started = Instant::now();
-                let result = match timeout(
-                    Duration::from_secs(EXTRACT_BATCH_TIMEOUT_SECS),
-                    extract_facts_from_batch(
-                        &app, &settings, &question, &profile, &hierarchy, &batch, &run_id,
-                        &cancel,
-                    ),
+                let result = extract_facts_from_batch(
+                    &app, &settings, &question, &profile, &hierarchy, &batch, &run_id, &cancel,
                 )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(format!(
-                        "soft_limit: 根拠抽出バッチが{}秒以内に返らなかったため、並列数を下げて再試行します",
-                        EXTRACT_BATCH_TIMEOUT_SECS
-                    )),
-                };
+                .await;
                 match &result {
                     Ok(facts) => log_extract_debug(format!(
                         "batch done run={} batch={}/{} facts={} elapsed_ms={}",
@@ -2876,7 +2899,7 @@ async fn extract_fact_batches(
                     "extract",
                     "running",
                     &format!(
-                        "DeepSeekの制限または応答遅延を検知したため、並列数を{}から{}に下げて続行します",
+                        "DeepSeekの制限を検知したため、並列数を{}から{}に下げて続行します",
                         previous, concurrency
                     ),
                     Some(run_id.to_string()),
@@ -2933,13 +2956,10 @@ fn estimate_batch_chars(batch: &[ChunkRecord]) -> usize {
 fn is_rate_limit_error(error: &str) -> bool {
     let lower = error.to_lowercase();
     lower.starts_with("rate_limit:")
-        || lower.starts_with("soft_limit:")
         || lower.contains("too many requests")
         || lower.contains("429")
         || lower.contains("rate limit")
-        || lower.contains("timed out")
         || error.contains("制限")
-        || error.contains("返らなかった")
 }
 
 fn truncate_log_text(text: &str, max_chars: usize) -> String {
@@ -3840,7 +3860,7 @@ async fn synthesize_answer(
         messages,
         3_500,
         false,
-        true,
+        false,
         Some(run_id),
         cancel,
     )
@@ -3938,6 +3958,36 @@ async fn revise_answer_from_audit(
         cancel,
     )
     .await
+}
+
+async fn emit_answer_chunks(app: &AppHandle, run_id: &str, answer: &str) {
+    let mut chunk = String::new();
+    let mut chunk_len = 0usize;
+
+    for ch in answer.chars() {
+        chunk.push(ch);
+        chunk_len += 1;
+        if chunk_len >= 80 || ch == '\n' {
+            emit_answer_delta(app, run_id, &chunk);
+            chunk.clear();
+            chunk_len = 0;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    if !chunk.is_empty() {
+        emit_answer_delta(app, run_id, &chunk);
+    }
+}
+
+fn emit_answer_delta(app: &AppHandle, run_id: &str, delta: &str) {
+    let _ = app.emit(
+        "answer-delta",
+        json!({
+            "runId": run_id,
+            "delta": delta
+        }),
+    );
 }
 
 fn format_fact_for_prompt(index: usize, fact: &ExtractedFact) -> String {
