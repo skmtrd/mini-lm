@@ -246,6 +246,19 @@ struct AnswerResponse {
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct EvaluationMetrics {
+    context_recall: f64,
+    faithfulness: f64,
+    answer_relevance: f64,
+    concept_coverage: f64,
+    unsupported_count: usize,
+    relationship_error_count: usize,
+    scope_error_count: usize,
+    polarity_error_count: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct ExtractedFact {
     chunk_id: i64,
     file_name: String,
@@ -524,14 +537,41 @@ fn init_db(state: &AppStateInner) -> Result<(), String> {
             metadata_json TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS evaluation_items (
+            id INTEGER PRIMARY KEY,
+            question TEXT NOT NULL UNIQUE,
+            expected_terms_json TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS evaluation_runs (
+            id INTEGER PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES retrieval_runs(id) ON DELETE CASCADE,
+            evaluation_item_id INTEGER REFERENCES evaluation_items(id),
+            question TEXT NOT NULL,
+            context_recall REAL NOT NULL,
+            faithfulness REAL NOT NULL,
+            answer_relevance REAL NOT NULL,
+            concept_coverage REAL NOT NULL,
+            unsupported_count INTEGER NOT NULL,
+            relationship_error_count INTEGER NOT NULL,
+            scope_error_count INTEGER NOT NULL,
+            polarity_error_count INTEGER NOT NULL,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_documents_selected ON documents(selected);
         CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id, ordinal);
         CREATE INDEX IF NOT EXISTS idx_section_contexts_document ON section_contexts(document_id, heading_path);
         CREATE INDEX IF NOT EXISTS idx_chunk_ngrams_chunk ON chunk_ngrams(chunk_id);
         CREATE INDEX IF NOT EXISTS idx_extracted_facts_run ON extracted_facts(run_id);
+        CREATE INDEX IF NOT EXISTS idx_evaluation_runs_run ON evaluation_runs(run_id);
         "#,
     )
     .map_err(|e| e.to_string())?;
+    ensure_default_evaluation_items(&conn)?;
     Ok(())
 }
 
@@ -877,6 +917,18 @@ async fn answer_normally(
     let audit = audit_answer(app, settings, &answer, &hits, run_id, cancel).await.ok();
     let conn = state.conn()?;
     save_answer(&conn, run_id, &answer, audit.as_deref())?;
+    let profile = QuestionProfile::from_question(&request.question);
+    record_evaluation_metrics(
+        &conn,
+        run_id,
+        &request.question,
+        &profile,
+        &[],
+        &answer,
+        audit.as_deref(),
+        &hits,
+        &HierarchyContext::default(),
+    )?;
     complete_run(&conn, run_id, "complete", None)?;
 
     emit_progress(
@@ -1113,6 +1165,17 @@ async fn answer_comprehensively(
 
     let conn = state.conn()?;
     save_answer(&conn, run_id, &answer, audit.as_deref())?;
+    record_evaluation_metrics(
+        &conn,
+        run_id,
+        &request.question,
+        &profile,
+        &reduced_facts,
+        &answer,
+        audit.as_deref(),
+        &seed_hits,
+        &hierarchy,
+    )?;
     complete_run(&conn, run_id, "complete", None)?;
     emit_progress(
         app,
@@ -3576,6 +3639,238 @@ fn save_answer(conn: &Connection, run_id: &str, answer: &str, audit: Option<&str
     Ok(())
 }
 
+fn ensure_default_evaluation_items(conn: &Connection) -> Result<(), String> {
+    for (question, expected_terms) in default_evaluation_items() {
+        conn.execute(
+            r#"
+            INSERT INTO evaluation_items(question, expected_terms_json, active, created_at)
+            VALUES (?1, ?2, 1, ?3)
+            ON CONFLICT(question) DO NOTHING
+            "#,
+            params![
+                question,
+                serde_json::to_string(&expected_terms).unwrap_or_else(|_| "[]".to_string()),
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn default_evaluation_items() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        ("手当はどうなっていますか", vec!["手当"]),
+        ("休暇はどうなっていますか", vec!["休暇"]),
+        ("申請や届出の手続きはどうなっていますか", vec!["申請", "届出", "手続"]),
+        ("対象者や対象外はどうなっていますか", vec!["対象", "対象外"]),
+        ("例外やただし書きはありますか", vec!["例外", "ただし"]),
+    ]
+}
+
+fn record_evaluation_metrics(
+    conn: &Connection,
+    run_id: &str,
+    question: &str,
+    profile: &QuestionProfile,
+    facts: &[ExtractedFact],
+    answer: &str,
+    audit: Option<&str>,
+    hits: &[SearchHit],
+    hierarchy: &HierarchyContext,
+) -> Result<(), String> {
+    let metrics = compute_evaluation_metrics(question, profile, facts, answer, audit, hits, hierarchy);
+    let evaluation_item_id = find_evaluation_item_id(conn, question)?;
+    let metadata = json!({
+        "profile_terms": profile.terms,
+        "profile_aspects": profile.aspects,
+        "lower_concepts": profile.lower_concepts,
+        "is_broad": profile.is_broad,
+        "fact_count": facts.len(),
+        "hit_count": hits.len(),
+        "corpus_concepts": hierarchy.corpus_concepts,
+    });
+    conn.execute(
+        r#"
+        INSERT INTO evaluation_runs(
+            run_id, evaluation_item_id, question, context_recall, faithfulness, answer_relevance,
+            concept_coverage, unsupported_count, relationship_error_count, scope_error_count,
+            polarity_error_count, metadata_json, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "#,
+        params![
+            run_id,
+            evaluation_item_id,
+            question,
+            metrics.context_recall,
+            metrics.faithfulness,
+            metrics.answer_relevance,
+            metrics.concept_coverage,
+            metrics.unsupported_count as i64,
+            metrics.relationship_error_count as i64,
+            metrics.scope_error_count as i64,
+            metrics.polarity_error_count as i64,
+            metadata.to_string(),
+            Utc::now().to_rfc3339()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn find_evaluation_item_id(conn: &Connection, question: &str) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT id FROM evaluation_items WHERE question = ?1 AND active = 1",
+        params![question.trim()],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+fn compute_evaluation_metrics(
+    question: &str,
+    profile: &QuestionProfile,
+    facts: &[ExtractedFact],
+    answer: &str,
+    audit: Option<&str>,
+    hits: &[SearchHit],
+    hierarchy: &HierarchyContext,
+) -> EvaluationMetrics {
+    let (unsupported_count, relationship_error_count, scope_error_count, polarity_error_count, verdict) =
+        audit_error_counts(audit);
+    let concept_coverage = compute_concept_coverage(profile, facts, answer);
+    let context_recall = compute_context_recall(profile, facts, hits, hierarchy, concept_coverage);
+    let faithfulness = compute_faithfulness_score(
+        &verdict,
+        unsupported_count,
+        relationship_error_count,
+        scope_error_count,
+        polarity_error_count,
+    );
+    let answer_relevance = compute_answer_relevance(question, profile, answer);
+    EvaluationMetrics {
+        context_recall,
+        faithfulness,
+        answer_relevance,
+        concept_coverage,
+        unsupported_count,
+        relationship_error_count,
+        scope_error_count,
+        polarity_error_count,
+    }
+}
+
+fn audit_error_counts(audit: Option<&str>) -> (usize, usize, usize, usize, String) {
+    let Some(raw) = audit else {
+        return (0, 0, 0, 0, "unknown".to_string());
+    };
+    let parsed = serde_json::from_str::<JsonValue>(raw).unwrap_or_else(|_| json!({}));
+    let source = parsed.get("final").unwrap_or(&parsed);
+    let unsupported = json_array_len(source, "unsupported_claims");
+    let relationship = json_array_len(source, "relationship_errors");
+    let scope = json_array_len(source, "scope_errors");
+    let polarity = json_array_len(source, "polarity_errors");
+    let verdict = source
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    (unsupported, relationship, scope, polarity, verdict)
+}
+
+fn json_array_len(value: &JsonValue, key: &str) -> usize {
+    value.get(key).and_then(|v| v.as_array()).map_or(0, Vec::len)
+}
+
+fn compute_concept_coverage(profile: &QuestionProfile, facts: &[ExtractedFact], answer: &str) -> f64 {
+    if profile.lower_concepts.is_empty() {
+        return if facts.is_empty() { 0.0 } else { 1.0 };
+    }
+    let covered = profile
+        .lower_concepts
+        .iter()
+        .filter(|concept| {
+            answer.contains(concept.as_str())
+                || facts.iter().any(|fact| {
+                    fact.object.contains(concept.as_str())
+                        || fact.scope.contains(concept.as_str())
+                        || fact.statement.contains(concept.as_str())
+                })
+        })
+        .count();
+    ratio(covered, profile.lower_concepts.len())
+}
+
+fn compute_context_recall(
+    profile: &QuestionProfile,
+    facts: &[ExtractedFact],
+    hits: &[SearchHit],
+    hierarchy: &HierarchyContext,
+    concept_coverage: f64,
+) -> f64 {
+    if facts.is_empty() {
+        return 0.0;
+    }
+    let fact_chunk_ids = facts.iter().map(|fact| fact.chunk_id).collect::<HashSet<_>>();
+    let hit_chunk_ids = hits.iter().map(|hit| hit.chunk_id).collect::<HashSet<_>>();
+    let hit_overlap = if hit_chunk_ids.is_empty() {
+        0.5
+    } else {
+        ratio(
+            fact_chunk_ids
+                .iter()
+                .filter(|id| hit_chunk_ids.contains(id))
+                .count(),
+            fact_chunk_ids.len().max(1),
+        )
+    };
+    let hierarchy_bonus = if hierarchy.sections.is_empty() { 0.0 } else { 0.15 };
+    let broad_weight = if profile.is_broad { concept_coverage * 0.55 } else { 0.35 };
+    clamp01(hit_overlap * 0.45 + broad_weight + hierarchy_bonus)
+}
+
+fn compute_faithfulness_score(
+    verdict: &str,
+    unsupported: usize,
+    relationship: usize,
+    scope: usize,
+    polarity: usize,
+) -> f64 {
+    let base = match verdict {
+        "pass" => 1.0,
+        "warning" => 0.65,
+        "fail" => 0.25,
+        _ => 0.75,
+    };
+    let penalty = unsupported as f64 * 0.12 + relationship as f64 * 0.14 + scope as f64 * 0.14 + polarity as f64 * 0.14;
+    clamp01(base - penalty)
+}
+
+fn compute_answer_relevance(question: &str, profile: &QuestionProfile, answer: &str) -> f64 {
+    let mut terms = meaningful_question_terms(question, &profile.search_terms());
+    terms.extend(profile.lower_concepts.iter().take(20).cloned());
+    normalize_string_list(&mut terms);
+    if terms.is_empty() {
+        return if answer.trim().is_empty() { 0.0 } else { 1.0 };
+    }
+    let matched = terms.iter().filter(|term| answer.contains(term.as_str())).count();
+    clamp01(ratio(matched, terms.len()) * 0.8 + if answer.trim().is_empty() { 0.0 } else { 0.2 })
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn clamp01(value: f64) -> f64 {
+    value.max(0.0).min(1.0)
+}
+
 fn load_settings(conn: &Connection) -> Result<Settings, String> {
     let mut settings = Settings::default();
     settings.source_path = get_setting(conn, "source_path")?;
@@ -4242,5 +4537,56 @@ mod tests {
         assert!(push_unique_fact(&mut facts, fact.clone()));
         assert!(!push_unique_fact(&mut facts, fact));
         assert_eq!(facts.len(), 1);
+    }
+
+    #[test]
+    fn default_evaluation_items_are_seeded() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("mini-lm-test.sqlite3");
+        let state = AppStateInner::new(db_path);
+        init_db(&state).unwrap();
+        let conn = state.conn().unwrap();
+        let count = scalar_i64(&conn, "SELECT COUNT(*) FROM evaluation_items").unwrap();
+
+        assert!(count >= 5);
+    }
+
+    #[test]
+    fn evaluation_metrics_penalize_audit_errors_and_track_concepts() {
+        let mut profile = QuestionProfile::from_question("手当はどうなっていますか");
+        profile.lower_concepts = vec!["扶養手当".to_string(), "住宅手当".to_string()];
+        let facts = vec![ExtractedFact {
+            chunk_id: 1,
+            file_name: "rules.txt".to_string(),
+            path: "/tmp/rules.txt".to_string(),
+            heading_path: "第1条 扶養手当".to_string(),
+            char_start: 0,
+            char_end: 10,
+            statement: "扶養手当は支給する。".to_string(),
+            scope: "給与規程".to_string(),
+            subject: "職員".to_string(),
+            object: "扶養手当".to_string(),
+            condition: "扶養親族を有する場合".to_string(),
+            effect: "支給する".to_string(),
+            exception: "".to_string(),
+            polarity: "conditional".to_string(),
+            quote: "支給する".to_string(),
+            confidence: "high".to_string(),
+        }];
+        let audit =
+            r#"{"verdict":"warning","unsupported_claims":["x"],"relationship_errors":[],"scope_errors":[],"polarity_errors":[]}"#;
+        let metrics = compute_evaluation_metrics(
+            "手当はどうなっていますか",
+            &profile,
+            &facts,
+            "扶養手当は支給されます。",
+            Some(audit),
+            &[],
+            &HierarchyContext::default(),
+        );
+
+        assert!(metrics.concept_coverage > 0.0);
+        assert!(metrics.faithfulness < 1.0);
+        assert_eq!(metrics.unsupported_count, 1);
     }
 }
