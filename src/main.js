@@ -19,6 +19,7 @@ const state = {
   currentAssistantHasAnswer: false,
   toastSeq: 0,
   autoScroll: true,
+  lastProgressStage: "profile",
 };
 
 document.querySelector("#app").innerHTML = `
@@ -254,6 +255,7 @@ async function answerQuestion() {
   state.currentRunId = null;
   state.currentAssistantRaw = "";
   state.currentAssistantHasAnswer = false;
+  state.lastProgressStage = "profile";
 
   try {
     renderAssistantStatus("調べています", "資料全体を確認し、回答に必要な根拠を抽出しています。");
@@ -304,11 +306,35 @@ function renderProgress(payload) {
   if (payload.runId) state.currentRunId = payload.runId;
   if (!state.currentAssistantBody || state.currentAssistantHasAnswer) return;
 
-  const total = payload.total ? `${formatNumber(payload.completed)}/${formatNumber(payload.total)}` : "";
-  const elapsed = payload.elapsedMs ? `${Math.round(payload.elapsedMs / 1000)}秒` : "";
-  const detail = [payload.message, total, elapsed].filter(Boolean).join(" ・ ");
+  if (payload.stage && payload.stage !== "api") {
+    state.lastProgressStage = payload.stage;
+  }
+  const detail = progressDetail(payload);
   const title = progressTitle(payload);
   renderAssistantStatus(title, detail, payload);
+}
+
+function progressDetail(payload) {
+  const { stage, message = "", elapsedMs = 0 } = payload;
+  if (stage === "api") {
+    if (message.includes("制限") || message.includes("停止")) return message;
+    return apiStageDetail(state.lastProgressStage);
+  }
+  const total = payload.total ? `${formatNumber(payload.completed)}/${formatNumber(payload.total)}` : "";
+  const elapsed = elapsedMs ? `${Math.round(elapsedMs / 1000)}秒` : "";
+  return [message, total, elapsed].filter(Boolean).join(" ・ ");
+}
+
+function apiStageDetail(stage) {
+  const details = {
+    profile: "検索語と確認観点を作っています。",
+    retrieve: "検索の準備を進めています。",
+    extract: "選択資料から根拠を抽出しています。",
+    synthesize: "抽出した根拠を統合しています。",
+    audit: "主張と根拠の対応を確認しています。",
+    answer: "回答文を受信しています。",
+  };
+  return details[stage] || "処理を進めています。";
 }
 
 function progressTitle(payload) {
@@ -335,10 +361,22 @@ function progressTitle(payload) {
   if (stage === "api") {
     if (message.includes("制限")) return "API制限の回復を待っています";
     if (message.includes("停止")) return "API応答で停止しました";
-    return "AIに処理を依頼しています";
+    return apiStageTitle(state.lastProgressStage);
   }
   if (stage === "index") return "資料を読み込んでいます";
   return "処理しています";
+}
+
+function apiStageTitle(stage) {
+  const labels = {
+    profile: "質問の意図を整理しています",
+    retrieve: "資料検索を準備しています",
+    extract: "根拠抽出を進めています",
+    synthesize: "回答を組み立てています",
+    audit: "回答のズレを点検しています",
+    answer: "回答を整えています",
+  };
+  return labels[stage] || "処理しています";
 }
 
 function renderAssistantStatus(title, detail, payload = {}) {
