@@ -1,0 +1,2609 @@
+use chrono::Utc;
+use futures_util::StreamExt;
+use regex::Regex;
+use reqwest::StatusCode;
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value as JsonValue};
+use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::time::{sleep, Duration};
+use uuid::Uuid;
+use walkdir::WalkDir;
+
+const KEYCHAIN_SERVICE: &str = "mini-lm";
+const KEYCHAIN_USER: &str = "deepseek-api-key";
+const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+const EMBEDDING_MODEL: &str = "mini-lm-ja-ngram-hash-v1";
+const EMBEDDING_DIMS: usize = 384;
+const DEFAULT_CONTEXT_CHARS: usize = 12_000;
+const DEFAULT_BATCH_CHARS: usize = 6_000;
+const MAX_SHORT_RATE_WAIT_MS: u64 = 15_000;
+const ALLOWED_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "csv", "tsv", "json", "log", "text"];
+
+#[derive(Clone)]
+struct AppStateInner {
+    db_path: PathBuf,
+    active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+}
+
+impl AppStateInner {
+    fn new(db_path: PathBuf) -> Self {
+        Self {
+            db_path,
+            active_cancel: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn conn(&self) -> Result<Connection, String> {
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| e.to_string())?;
+        Ok(conn)
+    }
+
+    fn begin_task(&self) -> Arc<AtomicBool> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Ok(mut slot) = self.active_cancel.lock() {
+            *slot = Some(cancel.clone());
+        }
+        cancel
+    }
+
+    fn clear_task(&self, token: &Arc<AtomicBool>) {
+        if let Ok(mut slot) = self.active_cancel.lock() {
+            if slot.as_ref().is_some_and(|active| Arc::ptr_eq(active, token)) {
+                *slot = None;
+            }
+        }
+    }
+
+    fn cancel_task(&self) -> bool {
+        if let Ok(slot) = self.active_cancel.lock() {
+            if let Some(cancel) = slot.as_ref() {
+                cancel.store(true, AtomicOrdering::SeqCst);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Settings {
+    source_path: Option<String>,
+    model: String,
+    thinking_enabled: bool,
+    reasoning_effort: String,
+    temperature: f32,
+    max_context_chars: usize,
+    comprehensive_batch_chars: usize,
+    api_key_saved: bool,
+    api_key_storage: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            source_path: None,
+            model: DEFAULT_MODEL.to_string(),
+            thinking_enabled: false,
+            reasoning_effort: "high".to_string(),
+            temperature: 0.1,
+            max_context_chars: DEFAULT_CONTEXT_CHARS,
+            comprehensive_batch_chars: DEFAULT_BATCH_CHARS,
+            api_key_saved: false,
+            api_key_storage: "os-keychain".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsUpdate {
+    model: String,
+    thinking_enabled: bool,
+    reasoning_effort: String,
+    temperature: f32,
+    max_context_chars: usize,
+    comprehensive_batch_chars: usize,
+    api_key: Option<String>,
+    clear_api_key: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppSnapshot {
+    settings: Settings,
+    documents: Vec<DocumentInfo>,
+    stats: AppStats,
+    db_path: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DocumentInfo {
+    id: i64,
+    path: String,
+    file_name: String,
+    size: i64,
+    mtime_ms: i64,
+    sha256: String,
+    char_count: i64,
+    selected: bool,
+    indexed_at: Option<String>,
+    status: String,
+    error: Option<String>,
+    chunk_count: i64,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AppStats {
+    document_count: i64,
+    selected_document_count: i64,
+    total_chars: i64,
+    selected_chars: i64,
+    chunk_count: i64,
+    embedding_count: i64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProgressPayload {
+    stage: String,
+    status: String,
+    message: String,
+    run_id: Option<String>,
+    completed: u64,
+    total: u64,
+    elapsed_ms: u128,
+    can_cancel: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexSummary {
+    scanned_files: usize,
+    indexed_files: usize,
+    skipped_files: usize,
+    failed_files: usize,
+    chunk_count: usize,
+    elapsed_ms: u128,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRequest {
+    query: String,
+    selected_document_ids: Vec<i64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchResponse {
+    hits: Vec<SearchHit>,
+    query_terms: Vec<String>,
+    scanned_vectors: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SearchHit {
+    chunk_id: i64,
+    document_id: i64,
+    file_name: String,
+    path: String,
+    heading_path: String,
+    char_start: i64,
+    char_end: i64,
+    snippet: String,
+    score: f64,
+    fts_score: f64,
+    ngram_score: f64,
+    vector_score: f64,
+    exact_bonus: f64,
+    heading_bonus: f64,
+    debug: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnswerRequest {
+    question: String,
+    mode: String,
+    selected_document_ids: Vec<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnswerResponse {
+    run_id: String,
+    status: String,
+    answer: String,
+    hits: Vec<SearchHit>,
+    facts: Vec<ExtractedFact>,
+    audit: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ExtractedFact {
+    chunk_id: i64,
+    file_name: String,
+    path: String,
+    heading_path: String,
+    char_start: i64,
+    char_end: i64,
+    statement: String,
+    quote: String,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkDraft {
+    content: String,
+    heading_path: String,
+    char_start: i64,
+    char_end: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkRecord {
+    id: i64,
+    document_id: i64,
+    file_name: String,
+    path: String,
+    heading_path: String,
+    char_start: i64,
+    char_end: i64,
+    content: String,
+    prev_chunk_id: Option<i64>,
+    next_chunk_id: Option<i64>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ScoreParts {
+    fts_rank: Option<usize>,
+    ngram_rank: Option<usize>,
+    vector_rank: Option<usize>,
+    fts_score: f64,
+    ngram_score: f64,
+    vector_score: f64,
+    rrf: f64,
+    exact_bonus: f64,
+    heading_bonus: f64,
+}
+
+#[derive(Debug)]
+struct ApiFailure {
+    class_name: String,
+    message: String,
+    retry_after_ms: Option<u64>,
+}
+
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let app_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("app data dir error: {e}"))?;
+            fs::create_dir_all(&app_dir)
+                .map_err(|e| format!("failed to create app data dir: {e}"))?;
+            let state = AppStateInner::new(app_dir.join("mini-lm.sqlite3"));
+            init_db(&state)?;
+            app.manage(state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_app_snapshot,
+            save_settings,
+            set_source_directory,
+            index_source_directory,
+            set_document_selected,
+            select_all_documents,
+            clear_document_selection,
+            hybrid_search,
+            answer_question,
+            cancel_current_task
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running mini-lm");
+}
+
+fn init_db(state: &AppStateInner) -> Result<(), String> {
+    let conn = state.conn()?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            file_name TEXT NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0,
+            mtime_ms INTEGER NOT NULL DEFAULT 0,
+            sha256 TEXT NOT NULL DEFAULT '',
+            char_count INTEGER NOT NULL DEFAULT 0,
+            selected INTEGER NOT NULL DEFAULT 1,
+            indexed_at TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            error TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS chunks (
+            id INTEGER PRIMARY KEY,
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            char_start INTEGER NOT NULL,
+            char_end INTEGER NOT NULL,
+            heading_path TEXT NOT NULL,
+            content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            prev_chunk_id INTEGER,
+            next_chunk_id INTEGER,
+            indexed_at TEXT NOT NULL
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
+            content,
+            heading_path,
+            file_name
+        );
+
+        CREATE TABLE IF NOT EXISTS chunk_ngrams (
+            term TEXT NOT NULL,
+            chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+            weight REAL NOT NULL,
+            PRIMARY KEY (term, chunk_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS chunk_embeddings (
+            chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+            dimensions INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            vector BLOB NOT NULL,
+            indexed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS questions (
+            id INTEGER PRIMARY KEY,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS retrieval_runs (
+            id TEXT PRIMARY KEY,
+            question_id INTEGER REFERENCES questions(id),
+            mode TEXT NOT NULL,
+            status TEXT NOT NULL,
+            selected_document_ids TEXT NOT NULL,
+            hits_json TEXT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            error TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS extracted_facts (
+            id INTEGER PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES retrieval_runs(id) ON DELETE CASCADE,
+            chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+            fact TEXT NOT NULL,
+            quote TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS answers (
+            id INTEGER PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES retrieval_runs(id) ON DELETE CASCADE,
+            answer TEXT NOT NULL,
+            audit_json TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            status TEXT NOT NULL,
+            message TEXT NOT NULL,
+            run_id TEXT,
+            metadata_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_documents_selected ON documents(selected);
+        CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id, ordinal);
+        CREATE INDEX IF NOT EXISTS idx_chunk_ngrams_chunk ON chunk_ngrams(chunk_id);
+        CREATE INDEX IF NOT EXISTS idx_extracted_facts_run ON extracted_facts(run_id);
+        "#,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_app_snapshot(state: State<'_, AppStateInner>) -> Result<AppSnapshot, String> {
+    let conn = state.conn()?;
+    let mut settings = load_settings(&conn)?;
+    settings.api_key_saved = load_api_key().is_ok();
+    Ok(AppSnapshot {
+        settings,
+        documents: load_documents(&conn)?,
+        stats: load_stats(&conn)?,
+        db_path: state.db_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn save_settings(update: SettingsUpdate, state: State<'_, AppStateInner>) -> Result<Settings, String> {
+    let conn = state.conn()?;
+    set_setting(&conn, "model", update.model.trim())?;
+    set_setting(
+        &conn,
+        "thinking_enabled",
+        if update.thinking_enabled { "true" } else { "false" },
+    )?;
+    set_setting(&conn, "reasoning_effort", update.reasoning_effort.trim())?;
+    set_setting(&conn, "temperature", &update.temperature.clamp(0.0, 1.0).to_string())?;
+    set_setting(
+        &conn,
+        "max_context_chars",
+        &update.max_context_chars.clamp(3_000, 80_000).to_string(),
+    )?;
+    set_setting(
+        &conn,
+        "comprehensive_batch_chars",
+        &update.comprehensive_batch_chars.clamp(2_000, 16_000).to_string(),
+    )?;
+
+    if update.clear_api_key {
+        delete_api_key()?;
+    } else if let Some(api_key) = update.api_key.as_deref() {
+        if !api_key.trim().is_empty() {
+            save_api_key(api_key.trim())?;
+        }
+    }
+
+    let mut settings = load_settings(&conn)?;
+    settings.api_key_saved = load_api_key().is_ok();
+    Ok(settings)
+}
+
+#[tauri::command]
+fn set_source_directory(path: String, state: State<'_, AppStateInner>) -> Result<AppSnapshot, String> {
+    let source = PathBuf::from(path.trim());
+    if !source.is_dir() {
+        return Err("指定されたsourceディレクトリが見つかりません。".to_string());
+    }
+    let conn = state.conn()?;
+    set_setting(&conn, "source_path", &source.to_string_lossy())?;
+    get_app_snapshot(state)
+}
+
+#[tauri::command]
+fn set_document_selected(id: i64, selected: bool, state: State<'_, AppStateInner>) -> Result<AppSnapshot, String> {
+    let conn = state.conn()?;
+    conn.execute(
+        "UPDATE documents SET selected = ?1 WHERE id = ?2",
+        params![if selected { 1 } else { 0 }, id],
+    )
+    .map_err(|e| e.to_string())?;
+    get_app_snapshot(state)
+}
+
+#[tauri::command]
+fn select_all_documents(state: State<'_, AppStateInner>) -> Result<AppSnapshot, String> {
+    let conn = state.conn()?;
+    conn.execute("UPDATE documents SET selected = 1 WHERE status != 'missing'", [])
+        .map_err(|e| e.to_string())?;
+    get_app_snapshot(state)
+}
+
+#[tauri::command]
+fn clear_document_selection(state: State<'_, AppStateInner>) -> Result<AppSnapshot, String> {
+    let conn = state.conn()?;
+    conn.execute("UPDATE documents SET selected = 0", [])
+        .map_err(|e| e.to_string())?;
+    get_app_snapshot(state)
+}
+
+#[tauri::command]
+fn cancel_current_task(state: State<'_, AppStateInner>) -> Result<bool, String> {
+    Ok(state.cancel_task())
+}
+
+#[tauri::command]
+fn index_source_directory(app: AppHandle, state: State<'_, AppStateInner>) -> Result<IndexSummary, String> {
+    let started = Instant::now();
+    let cancel = state.begin_task();
+    let result = index_source_directory_inner(&app, &state, &cancel, started);
+    state.clear_task(&cancel);
+    result
+}
+
+fn index_source_directory_inner(
+    app: &AppHandle,
+    state: &AppStateInner,
+    cancel: &Arc<AtomicBool>,
+    started: Instant,
+) -> Result<IndexSummary, String> {
+    let source_path = {
+        let conn = state.conn()?;
+        get_setting(&conn, "source_path")?
+    }
+    .ok_or_else(|| "sourceディレクトリが未設定です。".to_string())?;
+
+    let source = PathBuf::from(source_path);
+    if !source.is_dir() {
+        return Err("保存済みsourceディレクトリが見つかりません。".to_string());
+    }
+
+    emit_progress(
+        app,
+        started,
+        "index",
+        "running",
+        "sourceディレクトリを走査しています",
+        None,
+        0,
+        0,
+        true,
+    );
+
+    let files = collect_source_files(&source);
+    let total = files.len() as u64;
+    let found_paths: HashSet<String> = files
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    let mut indexed_files = 0usize;
+    let mut skipped_files = 0usize;
+    let mut failed_files = 0usize;
+    let mut total_chunks = 0usize;
+    let mut conn = state.conn()?;
+
+    mark_missing_documents(&conn, &found_paths)?;
+
+    for (idx, path) in files.iter().enumerate() {
+        if cancel.load(AtomicOrdering::SeqCst) {
+            emit_progress(
+                app,
+                started,
+                "index",
+                "cancelled",
+                "インデックス作成をキャンセルしました",
+                None,
+                idx as u64,
+                total,
+                false,
+            );
+            return Err("インデックス作成をキャンセルしました。".to_string());
+        }
+
+        emit_progress(
+            app,
+            started,
+            "index",
+            "running",
+            &format!("読み込み中: {}", path.file_name().unwrap_or_default().to_string_lossy()),
+            None,
+            idx as u64,
+            total,
+            true,
+        );
+
+        match index_one_file(&mut conn, path) {
+            Ok(FileIndexOutcome::Indexed(chunks)) => {
+                indexed_files += 1;
+                total_chunks += chunks;
+            }
+            Ok(FileIndexOutcome::Skipped) => {
+                skipped_files += 1;
+            }
+            Err(error) => {
+                failed_files += 1;
+                record_document_error(&conn, path, &error)?;
+            }
+        }
+    }
+
+    emit_progress(
+        app,
+        started,
+        "index",
+        "complete",
+        "インデックス作成が完了しました",
+        None,
+        total,
+        total,
+        false,
+    );
+
+    log_event(
+        &conn,
+        "index",
+        "complete",
+        "source indexing completed",
+        None,
+        json!({
+            "indexedFiles": indexed_files,
+            "skippedFiles": skipped_files,
+            "failedFiles": failed_files,
+            "chunks": total_chunks
+        }),
+    )?;
+
+    Ok(IndexSummary {
+        scanned_files: files.len(),
+        indexed_files,
+        skipped_files,
+        failed_files,
+        chunk_count: total_chunks,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+#[tauri::command]
+fn hybrid_search(request: SearchRequest, state: State<'_, AppStateInner>) -> Result<SearchResponse, String> {
+    let conn = state.conn()?;
+    let response = hybrid_search_internal(
+        &conn,
+        &request.query,
+        &request.selected_document_ids,
+        request.limit.unwrap_or(12),
+    )?;
+    Ok(response)
+}
+
+#[tauri::command]
+async fn answer_question(
+    app: AppHandle,
+    request: AnswerRequest,
+    state: State<'_, AppStateInner>,
+) -> Result<AnswerResponse, String> {
+    let started = Instant::now();
+    let cancel = state.begin_task();
+    let run_id = Uuid::new_v4().to_string();
+    let result = answer_question_inner(&app, &state, &request, &run_id, &cancel, started).await;
+    state.clear_task(&cancel);
+    result
+}
+
+async fn answer_question_inner(
+    app: &AppHandle,
+    state: &AppStateInner,
+    request: &AnswerRequest,
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+    started: Instant,
+) -> Result<AnswerResponse, String> {
+    if request.question.trim().is_empty() {
+        return Err("質問が空です。".to_string());
+    }
+
+    let settings = {
+        let conn = state.conn()?;
+        let mut loaded = load_settings(&conn)?;
+        loaded.api_key_saved = load_api_key().is_ok();
+        let question_id = insert_question(&conn, &request.question)?;
+        insert_run(
+            &conn,
+            run_id,
+            question_id,
+            &request.mode,
+            &request.selected_document_ids,
+        )?;
+        loaded
+    };
+
+    emit_progress(
+        app,
+        started,
+        "retrieve",
+        "running",
+        "ローカルインデックスを検索しています",
+        Some(run_id.to_string()),
+        0,
+        0,
+        true,
+    );
+
+    let search = {
+        let conn = state.conn()?;
+        let search = hybrid_search_internal(&conn, &request.question, &request.selected_document_ids, 16)?;
+        let hits_json = serde_json::to_string(&search.hits).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "UPDATE retrieval_runs SET hits_json = ?1 WHERE id = ?2",
+            params![hits_json, run_id],
+        )
+        .map_err(|e| e.to_string())?;
+        search
+    };
+
+    if search.hits.is_empty() {
+        let answer = "根拠が見つかりません。選択中のsource内に、この質問へ回答できる該当箇所は見つかりませんでした。".to_string();
+        let conn = state.conn()?;
+        save_answer(&conn, run_id, &answer, None)?;
+        complete_run(&conn, run_id, "complete", None)?;
+        emit_progress(
+            app,
+            started,
+            "answer",
+            "complete",
+            "根拠なしとして完了しました",
+            Some(run_id.to_string()),
+            1,
+            1,
+            false,
+        );
+        return Ok(AnswerResponse {
+            run_id: run_id.to_string(),
+            status: "complete".to_string(),
+            answer,
+            hits: vec![],
+            facts: vec![],
+            audit: None,
+        });
+    }
+
+    let is_comprehensive = request.mode == "comprehensive";
+    if is_comprehensive {
+        answer_comprehensively(app, state, &settings, request, run_id, cancel, started, search.hits).await
+    } else {
+        answer_normally(app, state, &settings, request, run_id, cancel, started, search.hits).await
+    }
+}
+
+async fn answer_normally(
+    app: &AppHandle,
+    state: &AppStateInner,
+    settings: &Settings,
+    request: &AnswerRequest,
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+    started: Instant,
+    hits: Vec<SearchHit>,
+) -> Result<AnswerResponse, String> {
+    emit_progress(
+        app,
+        started,
+        "answer",
+        "running",
+        "DeepSeekで回答を生成しています",
+        Some(run_id.to_string()),
+        0,
+        1,
+        true,
+    );
+
+    let context = build_context_from_hits(&hits, settings.max_context_chars);
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "あなたはローカル文書専用の回答エンジンです。回答は与えられたSOURCEだけを根拠にしてください。SOURCEにない情報は推測せず、根拠がないと明記してください。主要な主張には [S1] のように出典番号を付けてください。"
+        }),
+        json!({
+            "role": "user",
+            "content": format!("質問:\n{}\n\nSOURCE:\n{}\n\n要件:\n- source外の一般知識で補完しない\n- 条件、例外、金額、期間、手続き、対象者を落とさない\n- 根拠不足は根拠不足と書く\n- 日本語で簡潔かつ網羅的に答える", request.question, context)
+        }),
+    ];
+
+    let answer = call_deepseek(app, settings, messages, 2_000, false, true, Some(run_id), cancel).await?;
+    let audit = audit_answer(app, settings, &answer, &hits, run_id, cancel).await.ok();
+    let conn = state.conn()?;
+    save_answer(&conn, run_id, &answer, audit.as_deref())?;
+    complete_run(&conn, run_id, "complete", None)?;
+
+    emit_progress(
+        app,
+        started,
+        "answer",
+        "complete",
+        "回答が完了しました",
+        Some(run_id.to_string()),
+        1,
+        1,
+        false,
+    );
+
+    Ok(AnswerResponse {
+        run_id: run_id.to_string(),
+        status: "complete".to_string(),
+        answer,
+        hits,
+        facts: vec![],
+        audit,
+    })
+}
+
+async fn answer_comprehensively(
+    app: &AppHandle,
+    state: &AppStateInner,
+    settings: &Settings,
+    request: &AnswerRequest,
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+    started: Instant,
+    seed_hits: Vec<SearchHit>,
+) -> Result<AnswerResponse, String> {
+    emit_progress(
+        app,
+        started,
+        "profile",
+        "running",
+        "質問の観点と検索語を展開しています",
+        Some(run_id.to_string()),
+        0,
+        0,
+        true,
+    );
+
+    let profile_terms = build_question_profile(app, settings, &request.question, run_id, cancel)
+        .await
+        .unwrap_or_else(|_| extract_terms(&request.question));
+    let chunks = {
+        let conn = state.conn()?;
+        load_selected_chunks(&conn, &request.selected_document_ids)?
+    };
+    let batches = build_chunk_batches(&chunks, settings.comprehensive_batch_chars);
+    let total_batches = batches.len() as u64;
+    let mut facts = Vec::new();
+
+    for (idx, batch) in batches.iter().enumerate() {
+        if cancel.load(AtomicOrdering::SeqCst) {
+            let conn = state.conn()?;
+            complete_run(&conn, run_id, "cancelled", Some("ユーザーがキャンセルしました"))?;
+            emit_progress(
+                app,
+                started,
+                "extract",
+                "cancelled",
+                "網羅抽出をキャンセルしました",
+                Some(run_id.to_string()),
+                idx as u64,
+                total_batches,
+                false,
+            );
+            return Err("網羅抽出をキャンセルしました。".to_string());
+        }
+
+        emit_progress(
+            app,
+            started,
+            "extract",
+            "running",
+            &format!("全チャンク確認中: batch {}/{}", idx + 1, total_batches),
+            Some(run_id.to_string()),
+            idx as u64,
+            total_batches,
+            true,
+        );
+
+        let extracted = extract_facts_from_batch(
+            app,
+            settings,
+            &request.question,
+            &profile_terms,
+            batch,
+            run_id,
+            cancel,
+        )
+        .await?;
+
+        let conn = state.conn()?;
+        for fact in extracted {
+            insert_fact(&conn, run_id, &fact)?;
+            facts.push(fact);
+        }
+    }
+
+    emit_progress(
+        app,
+        started,
+        "synthesize",
+        "running",
+        "抽出事実を統合して最終回答を生成しています",
+        Some(run_id.to_string()),
+        total_batches,
+        total_batches,
+        true,
+    );
+
+    let reduced_facts = reduce_facts(app, settings, &request.question, &facts, run_id, cancel).await?;
+    let answer = synthesize_answer(app, settings, &request.question, &reduced_facts, run_id, cancel).await?;
+    let audit = audit_facts_answer(app, settings, &answer, &reduced_facts, run_id, cancel).await.ok();
+
+    let conn = state.conn()?;
+    save_answer(&conn, run_id, &answer, audit.as_deref())?;
+    complete_run(&conn, run_id, "complete", None)?;
+    emit_progress(
+        app,
+        started,
+        "answer",
+        "complete",
+        "高精度網羅回答が完了しました",
+        Some(run_id.to_string()),
+        total_batches,
+        total_batches,
+        false,
+    );
+
+    Ok(AnswerResponse {
+        run_id: run_id.to_string(),
+        status: "complete".to_string(),
+        answer,
+        hits: seed_hits,
+        facts: reduced_facts,
+        audit,
+    })
+}
+
+fn collect_source_files(source: &Path) -> Vec<PathBuf> {
+    let mut files = WalkDir::new(source)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| {
+            let path = entry.into_path();
+            let ext = path.extension()?.to_string_lossy().to_lowercase();
+            ALLOWED_EXTENSIONS.contains(&ext.as_str()).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+enum FileIndexOutcome {
+    Indexed(usize),
+    Skipped,
+}
+
+fn index_one_file(conn: &mut Connection, path: &Path) -> Result<FileIndexOutcome, String> {
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let mtime_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default();
+    let path_string = path.to_string_lossy().to_string();
+    let file_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let char_count = text.chars().count() as i64;
+    let existing = conn
+        .query_row(
+            "SELECT id, sha256, mtime_ms, size FROM documents WHERE path = ?1",
+            params![path_string],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    if let Some((doc_id, old_hash, old_mtime, old_size)) = existing {
+        let chunk_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE document_id = ?1",
+                params![doc_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if old_hash == sha256 && old_mtime == mtime_ms && old_size == metadata.len() as i64 && chunk_count > 0 {
+            return Ok(FileIndexOutcome::Skipped);
+        }
+    }
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let selected = tx
+        .query_row(
+            "SELECT selected FROM documents WHERE path = ?1",
+            params![path_string],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(1);
+
+    tx.execute(
+        r#"
+        INSERT INTO documents(path, file_name, size, mtime_ms, sha256, char_count, selected, indexed_at, status, error)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'indexing', NULL)
+        ON CONFLICT(path) DO UPDATE SET
+            file_name = excluded.file_name,
+            size = excluded.size,
+            mtime_ms = excluded.mtime_ms,
+            sha256 = excluded.sha256,
+            char_count = excluded.char_count,
+            selected = excluded.selected,
+            indexed_at = excluded.indexed_at,
+            status = 'indexing',
+            error = NULL
+        "#,
+        params![
+            path_string,
+            file_name,
+            metadata.len() as i64,
+            mtime_ms,
+            sha256,
+            char_count,
+            selected,
+            Utc::now().to_rfc3339()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let doc_id = tx
+        .query_row(
+            "SELECT id FROM documents WHERE path = ?1",
+            params![path_string],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let old_chunk_ids = tx
+        .prepare("SELECT id FROM chunks WHERE document_id = ?1")
+        .map_err(|e| e.to_string())?
+        .query_map(params![doc_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    for chunk_id in old_chunk_ids {
+        tx.execute("DELETE FROM chunk_fts WHERE rowid = ?1", params![chunk_id])
+            .map_err(|e| e.to_string())?;
+    }
+    tx.execute("DELETE FROM chunks WHERE document_id = ?1", params![doc_id])
+        .map_err(|e| e.to_string())?;
+
+    let chunks = split_text_into_chunks(&text);
+    let indexed_at = Utc::now().to_rfc3339();
+    let mut inserted_ids = Vec::with_capacity(chunks.len());
+
+    for (ordinal, chunk) in chunks.iter().enumerate() {
+        let content_hash = hex::encode(Sha256::digest(chunk.content.as_bytes()));
+        tx.execute(
+            r#"
+            INSERT INTO chunks(document_id, ordinal, char_start, char_end, heading_path, content, content_hash, indexed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                doc_id,
+                ordinal as i64,
+                chunk.char_start,
+                chunk.char_end,
+                chunk.heading_path,
+                chunk.content,
+                content_hash,
+                indexed_at
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let chunk_id = tx.last_insert_rowid();
+        inserted_ids.push(chunk_id);
+
+        tx.execute(
+            "INSERT INTO chunk_fts(rowid, content, heading_path, file_name) VALUES (?1, ?2, ?3, ?4)",
+            params![chunk_id, chunk.content, chunk.heading_path, file_name],
+        )
+        .map_err(|e| e.to_string())?;
+
+        let mut terms = term_weights(&chunk.content);
+        for (term, weight) in term_weights(&chunk.heading_path) {
+            *terms.entry(term).or_insert(0.0) += weight * 2.0;
+        }
+        insert_ngram_terms(&tx, chunk_id, terms)?;
+
+        let embedding = embedding_for_text(&format!("{}\n{}", chunk.heading_path, chunk.content));
+        tx.execute(
+            r#"
+            INSERT INTO chunk_embeddings(chunk_id, dimensions, model, vector, indexed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                chunk_id,
+                EMBEDDING_DIMS as i64,
+                EMBEDDING_MODEL,
+                encode_vector(&embedding),
+                indexed_at
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    for (idx, chunk_id) in inserted_ids.iter().enumerate() {
+        let prev = idx.checked_sub(1).map(|i| inserted_ids[i]);
+        let next = inserted_ids.get(idx + 1).copied();
+        tx.execute(
+            "UPDATE chunks SET prev_chunk_id = ?1, next_chunk_id = ?2 WHERE id = ?3",
+            params![prev, next, chunk_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    tx.execute(
+        "UPDATE documents SET status = 'indexed', indexed_at = ?1, error = NULL WHERE id = ?2",
+        params![Utc::now().to_rfc3339(), doc_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+
+    Ok(FileIndexOutcome::Indexed(chunks.len()))
+}
+
+fn split_text_into_chunks(text: &str) -> Vec<ChunkDraft> {
+    let heading_re = Regex::new(r"^\s*(第[0-9０-９一二三四五六七八九十百千]+(章|節|款|目|条).*)\s*$").unwrap();
+    let bracket_re = Regex::new(r"^\s*（[^）]{1,60}）\s*$").unwrap();
+    let mut sections = Vec::new();
+    let mut heading_stack: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_heading = String::new();
+    let mut current_start = 0i64;
+    let mut char_cursor = 0i64;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let is_heading = heading_re.is_match(trimmed) || bracket_re.is_match(trimmed);
+        if is_heading && !current.trim().is_empty() {
+            let end = current_start + current.chars().count() as i64;
+            sections.push(ChunkDraft {
+                content: current.trim().to_string(),
+                heading_path: current_heading.clone(),
+                char_start: current_start,
+                char_end: end,
+            });
+            current.clear();
+            current_start = char_cursor;
+        } else if current.is_empty() {
+            current_start = char_cursor;
+        }
+
+        if is_heading {
+            update_heading_stack(&mut heading_stack, trimmed);
+            current_heading = heading_stack.join(" > ");
+        }
+
+        current.push_str(line);
+        char_cursor += line.chars().count() as i64;
+    }
+
+    if !current.trim().is_empty() {
+        let end = current_start + current.chars().count() as i64;
+        sections.push(ChunkDraft {
+            content: current.trim().to_string(),
+            heading_path: current_heading,
+            char_start: current_start,
+            char_end: end,
+        });
+    }
+
+    pack_sections(sections)
+}
+
+fn update_heading_stack(stack: &mut Vec<String>, heading: &str) {
+    let level = if heading.contains('章') {
+        0
+    } else if heading.contains('節') {
+        1
+    } else if heading.contains('款') {
+        2
+    } else if heading.contains('目') {
+        3
+    } else if heading.contains('条') {
+        4
+    } else {
+        5
+    };
+    if stack.len() <= level {
+        stack.resize(level + 1, String::new());
+    }
+    stack[level] = heading.trim().to_string();
+    stack.truncate(level + 1);
+}
+
+fn pack_sections(sections: Vec<ChunkDraft>) -> Vec<ChunkDraft> {
+    let target_chars = 1_400usize;
+    let max_chars = 2_400usize;
+    let mut chunks = Vec::new();
+    let mut buffer = String::new();
+    let mut heading = String::new();
+    let mut start = 0i64;
+    let mut end = 0i64;
+
+    for section in sections {
+        let section_chars = section.content.chars().count();
+        if section_chars > max_chars {
+            if !buffer.trim().is_empty() {
+                chunks.push(ChunkDraft {
+                    content: buffer.trim().to_string(),
+                    heading_path: heading.clone(),
+                    char_start: start,
+                    char_end: end,
+                });
+                buffer.clear();
+            }
+            chunks.extend(split_long_section(section, max_chars));
+            continue;
+        }
+
+        let buffer_chars = buffer.chars().count();
+        if buffer_chars > 0 && buffer_chars + section_chars > target_chars {
+            chunks.push(ChunkDraft {
+                content: buffer.trim().to_string(),
+                heading_path: heading.clone(),
+                char_start: start,
+                char_end: end,
+            });
+            buffer.clear();
+        }
+
+        if buffer.is_empty() {
+            start = section.char_start;
+            heading = section.heading_path.clone();
+        }
+        if !buffer.is_empty() {
+            buffer.push_str("\n\n");
+        }
+        buffer.push_str(&section.content);
+        end = section.char_end;
+    }
+
+    if !buffer.trim().is_empty() {
+        chunks.push(ChunkDraft {
+            content: buffer.trim().to_string(),
+            heading_path: heading,
+            char_start: start,
+            char_end: end,
+        });
+    }
+
+    chunks
+}
+
+fn split_long_section(section: ChunkDraft, max_chars: usize) -> Vec<ChunkDraft> {
+    let mut chunks = Vec::new();
+    let mut buffer = String::new();
+    let mut start = section.char_start;
+    let mut cursor = section.char_start;
+
+    for paragraph in section.content.split_inclusive('\n') {
+        let paragraph_chars = paragraph.chars().count();
+        if !buffer.is_empty() && buffer.chars().count() + paragraph_chars > max_chars {
+            let end = start + buffer.chars().count() as i64;
+            chunks.push(ChunkDraft {
+                content: buffer.trim().to_string(),
+                heading_path: section.heading_path.clone(),
+                char_start: start,
+                char_end: end,
+            });
+            buffer.clear();
+            start = cursor;
+        }
+        buffer.push_str(paragraph);
+        cursor += paragraph_chars as i64;
+    }
+
+    if !buffer.trim().is_empty() {
+        let end = start + buffer.chars().count() as i64;
+        chunks.push(ChunkDraft {
+            content: buffer.trim().to_string(),
+            heading_path: section.heading_path,
+            char_start: start,
+            char_end: end,
+        });
+    }
+    chunks
+}
+
+fn insert_ngram_terms(conn: &Connection, chunk_id: i64, terms: HashMap<String, f64>) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            INSERT INTO chunk_ngrams(term, chunk_id, weight)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(term, chunk_id) DO UPDATE SET weight = excluded.weight
+            "#,
+        )
+        .map_err(|e| e.to_string())?;
+    for (term, weight) in terms {
+        if !term.trim().is_empty() {
+            stmt.execute(params![term, chunk_id, weight.min(12.0)])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn hybrid_search_internal(
+    conn: &Connection,
+    query: &str,
+    requested_doc_ids: &[i64],
+    limit: usize,
+) -> Result<SearchResponse, String> {
+    let query_terms = extract_terms(query);
+    let selected_doc_ids = selected_document_ids(conn, requested_doc_ids)?;
+    if selected_doc_ids.is_empty() {
+        return Ok(SearchResponse {
+            hits: vec![],
+            query_terms,
+            scanned_vectors: 0,
+        });
+    }
+
+    let selected_set: HashSet<i64> = selected_doc_ids.iter().copied().collect();
+    let fts_ranking = run_fts_search(conn, query, &query_terms, &selected_set)?;
+    let ngram_ranking = run_ngram_search(conn, &query_terms, &selected_doc_ids)?;
+    let (vector_ranking, scanned_vectors) = run_vector_search(conn, query, &selected_doc_ids)?;
+
+    let mut scores: HashMap<i64, ScoreParts> = HashMap::new();
+    apply_ranking(&mut scores, &fts_ranking, "fts", 1.0);
+    apply_ranking(&mut scores, &ngram_ranking, "ngram", 1.15);
+    apply_ranking(&mut scores, &vector_ranking, "vector", 0.95);
+
+    let mut candidate_ids: Vec<i64> = scores.keys().copied().collect();
+    candidate_ids.sort_unstable();
+    let records = load_chunk_records(conn, &candidate_ids)?;
+    let record_map: HashMap<i64, ChunkRecord> = records.into_iter().map(|r| (r.id, r)).collect();
+
+    for (chunk_id, parts) in scores.iter_mut() {
+        if let Some(record) = record_map.get(chunk_id) {
+            parts.exact_bonus = exact_bonus(query, &query_terms, &record.content);
+            parts.heading_bonus = exact_bonus(query, &query_terms, &record.heading_path) * 1.4;
+        }
+    }
+
+    let mut ranked: Vec<(i64, f64)> = scores
+        .iter()
+        .map(|(id, parts)| {
+            let score = parts.rrf
+                + parts.exact_bonus
+                + parts.heading_bonus
+                + parts.ngram_score * 0.004
+                + parts.vector_score.max(0.0) * 0.08
+                + parts.fts_score * 0.03;
+            (*id, score)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+    let mut expanded_ids = Vec::new();
+    for (chunk_id, _) in ranked.iter().take(limit * 2) {
+        if let Some(record) = record_map.get(chunk_id) {
+            if let Some(prev) = record.prev_chunk_id {
+                expanded_ids.push(prev);
+            }
+            expanded_ids.push(*chunk_id);
+            if let Some(next) = record.next_chunk_id {
+                expanded_ids.push(next);
+            }
+        }
+    }
+    expanded_ids.sort_unstable();
+    expanded_ids.dedup();
+
+    for neighbor_id in expanded_ids {
+        scores.entry(neighbor_id).or_insert_with(|| ScoreParts {
+            rrf: 0.003,
+            ..ScoreParts::default()
+        });
+    }
+
+    let final_ids: Vec<i64> = scores.keys().copied().collect();
+    let final_records = load_chunk_records(conn, &final_ids)?;
+    let final_map: HashMap<i64, ChunkRecord> = final_records.into_iter().map(|r| (r.id, r)).collect();
+    let mut hits = Vec::new();
+
+    for (chunk_id, parts) in scores.iter_mut() {
+        if let Some(record) = final_map.get(chunk_id) {
+            parts.exact_bonus = parts.exact_bonus.max(exact_bonus(query, &query_terms, &record.content));
+            parts.heading_bonus = parts
+                .heading_bonus
+                .max(exact_bonus(query, &query_terms, &record.heading_path) * 1.4);
+            let score = parts.rrf
+                + parts.exact_bonus
+                + parts.heading_bonus
+                + parts.ngram_score * 0.004
+                + parts.vector_score.max(0.0) * 0.08
+                + parts.fts_score * 0.03;
+            hits.push(SearchHit {
+                chunk_id: *chunk_id,
+                document_id: record.document_id,
+                file_name: record.file_name.clone(),
+                path: record.path.clone(),
+                heading_path: record.heading_path.clone(),
+                char_start: record.char_start,
+                char_end: record.char_end,
+                snippet: make_snippet(&record.content, &query_terms, 700),
+                score,
+                fts_score: parts.fts_score,
+                ngram_score: parts.ngram_score,
+                vector_score: parts.vector_score,
+                exact_bonus: parts.exact_bonus,
+                heading_bonus: parts.heading_bonus,
+                debug: format!(
+                    "fts={:?} ngram={:?} vector={:?} rrf={:.4}",
+                    parts.fts_rank, parts.ngram_rank, parts.vector_rank, parts.rrf
+                ),
+            });
+        }
+    }
+
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    diversify_hits(&mut hits, limit);
+    hits.truncate(limit);
+
+    Ok(SearchResponse {
+        hits,
+        query_terms,
+        scanned_vectors,
+    })
+}
+
+fn run_fts_search(
+    conn: &Connection,
+    query: &str,
+    query_terms: &[String],
+    selected_set: &HashSet<i64>,
+) -> Result<Vec<(i64, f64)>, String> {
+    let mut terms = vec![query.trim().to_string()];
+    terms.extend(query_terms.iter().take(12).cloned());
+    terms.retain(|t| t.chars().count() >= 2);
+    terms.sort();
+    terms.dedup();
+    if terms.is_empty() {
+        return Ok(vec![]);
+    }
+    let fts_query = terms
+        .iter()
+        .take(10)
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT c.id, c.document_id, bm25(chunk_fts) AS rank
+            FROM chunk_fts
+            JOIN chunks c ON c.id = chunk_fts.rowid
+            WHERE chunk_fts MATCH ?1
+            ORDER BY rank
+            LIMIT 180
+            "#,
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map(params![fts_query], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string());
+
+    match rows {
+        Ok(mapped) => {
+            let mut out = Vec::new();
+            for row in mapped {
+                let (chunk_id, document_id, rank) = row.map_err(|e| e.to_string())?;
+                if selected_set.contains(&document_id) {
+                    out.push((chunk_id, 1.0 / (1.0 + rank.abs())));
+                }
+            }
+            Ok(out)
+        }
+        Err(_) => Ok(vec![]),
+    }
+}
+
+fn run_ngram_search(
+    conn: &Connection,
+    query_terms: &[String],
+    selected_doc_ids: &[i64],
+) -> Result<Vec<(i64, f64)>, String> {
+    if query_terms.is_empty() || selected_doc_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut terms = query_terms.iter().take(60).cloned().collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    let doc_placeholders = placeholders(selected_doc_ids.len());
+    let term_placeholders = placeholders(terms.len());
+    let sql = format!(
+        r#"
+        SELECT n.chunk_id, SUM(n.weight) AS score
+        FROM chunk_ngrams n
+        JOIN chunks c ON c.id = n.chunk_id
+        WHERE c.document_id IN ({}) AND n.term IN ({})
+        GROUP BY n.chunk_id
+        ORDER BY score DESC
+        LIMIT 220
+        "#,
+        doc_placeholders, term_placeholders
+    );
+    let mut values: Vec<Value> = selected_doc_ids.iter().map(|id| Value::Integer(*id)).collect();
+    values.extend(terms.into_iter().map(Value::Text));
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params_from_iter(values), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+fn run_vector_search(
+    conn: &Connection,
+    query: &str,
+    selected_doc_ids: &[i64],
+) -> Result<(Vec<(i64, f64)>, usize), String> {
+    if selected_doc_ids.is_empty() {
+        return Ok((vec![], 0));
+    }
+    let doc_placeholders = placeholders(selected_doc_ids.len());
+    let sql = format!(
+        r#"
+        SELECT e.chunk_id, e.vector
+        FROM chunk_embeddings e
+        JOIN chunks c ON c.id = e.chunk_id
+        WHERE c.document_id IN ({}) AND e.model = ?{}
+        "#,
+        doc_placeholders,
+        selected_doc_ids.len() + 1
+    );
+    let mut values: Vec<Value> = selected_doc_ids.iter().map(|id| Value::Integer(*id)).collect();
+    values.push(Value::Text(EMBEDDING_MODEL.to_string()));
+    let query_vector = embedding_for_text(query);
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params_from_iter(values), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut scored = Vec::new();
+    let mut scanned = 0usize;
+    for row in rows {
+        let (chunk_id, blob) = row.map_err(|e| e.to_string())?;
+        let vector = decode_vector(&blob);
+        if vector.len() == EMBEDDING_DIMS {
+            scanned += 1;
+            scored.push((chunk_id, dot_product(&query_vector, &vector)));
+        }
+    }
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    scored.truncate(220);
+    Ok((scored, scanned))
+}
+
+fn apply_ranking(scores: &mut HashMap<i64, ScoreParts>, ranking: &[(i64, f64)], kind: &str, weight: f64) {
+    for (rank, (chunk_id, raw_score)) in ranking.iter().enumerate() {
+        let parts = scores.entry(*chunk_id).or_default();
+        parts.rrf += weight / (60.0 + rank as f64 + 1.0);
+        match kind {
+            "fts" => {
+                parts.fts_rank = Some(rank + 1);
+                parts.fts_score = *raw_score;
+            }
+            "ngram" => {
+                parts.ngram_rank = Some(rank + 1);
+                parts.ngram_score = *raw_score;
+            }
+            "vector" => {
+                parts.vector_rank = Some(rank + 1);
+                parts.vector_score = *raw_score;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn selected_document_ids(conn: &Connection, requested_doc_ids: &[i64]) -> Result<Vec<i64>, String> {
+    if !requested_doc_ids.is_empty() {
+        return Ok(requested_doc_ids.to_vec());
+    }
+    let mut stmt = conn
+        .prepare("SELECT id FROM documents WHERE selected = 1 AND status = 'indexed' ORDER BY file_name")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+fn load_chunk_records(conn: &Connection, chunk_ids: &[i64]) -> Result<Vec<ChunkRecord>, String> {
+    if chunk_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders = placeholders(chunk_ids.len());
+    let sql = format!(
+        r#"
+        SELECT c.id, c.document_id, d.file_name, d.path, c.heading_path, c.char_start, c.char_end,
+               c.content, c.prev_chunk_id, c.next_chunk_id
+        FROM chunks c
+        JOIN documents d ON d.id = c.document_id
+        WHERE c.id IN ({})
+        "#,
+        placeholders
+    );
+    let values: Vec<Value> = chunk_ids.iter().map(|id| Value::Integer(*id)).collect();
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params_from_iter(values), |row| {
+            Ok(ChunkRecord {
+                id: row.get(0)?,
+                document_id: row.get(1)?,
+                file_name: row.get(2)?,
+                path: row.get(3)?,
+                heading_path: row.get(4)?,
+                char_start: row.get(5)?,
+                char_end: row.get(6)?,
+                content: row.get(7)?,
+                prev_chunk_id: row.get(8)?,
+                next_chunk_id: row.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+fn load_selected_chunks(conn: &Connection, requested_doc_ids: &[i64]) -> Result<Vec<ChunkRecord>, String> {
+    let doc_ids = selected_document_ids(conn, requested_doc_ids)?;
+    if doc_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let doc_placeholders = placeholders(doc_ids.len());
+    let sql = format!(
+        r#"
+        SELECT c.id, c.document_id, d.file_name, d.path, c.heading_path, c.char_start, c.char_end,
+               c.content, c.prev_chunk_id, c.next_chunk_id
+        FROM chunks c
+        JOIN documents d ON d.id = c.document_id
+        WHERE c.document_id IN ({})
+        ORDER BY d.file_name, c.ordinal
+        "#,
+        doc_placeholders
+    );
+    let values: Vec<Value> = doc_ids.iter().map(|id| Value::Integer(*id)).collect();
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params_from_iter(values), |row| {
+            Ok(ChunkRecord {
+                id: row.get(0)?,
+                document_id: row.get(1)?,
+                file_name: row.get(2)?,
+                path: row.get(3)?,
+                heading_path: row.get(4)?,
+                char_start: row.get(5)?,
+                char_end: row.get(6)?,
+                content: row.get(7)?,
+                prev_chunk_id: row.get(8)?,
+                next_chunk_id: row.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+fn build_chunk_batches(chunks: &[ChunkRecord], max_chars: usize) -> Vec<Vec<ChunkRecord>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_chars = 0usize;
+    for chunk in chunks {
+        let len = chunk.content.chars().count() + chunk.heading_path.chars().count() + 80;
+        if !current.is_empty() && current_chars + len > max_chars {
+            batches.push(current);
+            current = Vec::new();
+            current_chars = 0;
+        }
+        current.push(chunk.clone());
+        current_chars += len;
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+async fn build_question_profile(
+    app: &AppHandle,
+    settings: &Settings,
+    question: &str,
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<String>, String> {
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "質問から、ローカル文書検索に使う日本語検索語、同義語、表記揺れ、観点をJSONだけで返してください。形式: {\"terms\":[\"...\"],\"aspects\":[\"...\"]}"
+        }),
+        json!({"role": "user", "content": question}),
+    ];
+    let content = call_deepseek(app, settings, messages, 800, true, false, Some(run_id), cancel).await?;
+    let mut terms = extract_terms(question);
+    if let Ok(parsed) = serde_json::from_str::<JsonValue>(&content) {
+        for key in ["terms", "aspects"] {
+            if let Some(items) = parsed.get(key).and_then(|v| v.as_array()) {
+                for item in items {
+                    if let Some(text) = item.as_str() {
+                        terms.extend(extract_terms(text));
+                        if text.chars().count() >= 2 && text.chars().count() <= 40 {
+                            terms.push(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    terms.sort();
+    terms.dedup();
+    Ok(terms)
+}
+
+async fn extract_facts_from_batch(
+    app: &AppHandle,
+    settings: &Settings,
+    question: &str,
+    profile_terms: &[String],
+    batch: &[ChunkRecord],
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<ExtractedFact>, String> {
+    let mut source = String::new();
+    for chunk in batch {
+        source.push_str(&format!(
+            "\n[C{}] file={} chars={}-{} heading={}\n{}\n",
+            chunk.id, chunk.file_name, chunk.char_start, chunk.char_end, chunk.heading_path, chunk.content
+        ));
+    }
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "あなたは文書監査用の抽出器です。質問に関係する事実だけをSOURCEから抽出してください。SOURCEにない推測は禁止です。JSONだけで返してください。形式: {\"facts\":[{\"chunk_id\":123,\"statement\":\"...\",\"quote\":\"SOURCE中の短い根拠引用\"}]}"
+        }),
+        json!({
+            "role": "user",
+            "content": format!("質問:\n{}\n\n検索観点:\n{}\n\nSOURCE:\n{}", question, profile_terms.join(", "), source)
+        }),
+    ];
+    let content = call_deepseek(app, settings, messages, 1_400, true, false, Some(run_id), cancel).await?;
+    let parsed = serde_json::from_str::<JsonValue>(&content).unwrap_or_else(|_| json!({"facts":[]}));
+    let mut out = Vec::new();
+    if let Some(items) = parsed.get("facts").and_then(|v| v.as_array()) {
+        for item in items {
+            let chunk_id = item.get("chunk_id").and_then(|v| v.as_i64()).unwrap_or_default();
+            let statement = item
+                .get("statement")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let quote = item
+                .get("quote")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if statement.is_empty() {
+                continue;
+            }
+            if let Some(chunk) = batch.iter().find(|c| c.id == chunk_id) {
+                out.push(ExtractedFact {
+                    chunk_id,
+                    file_name: chunk.file_name.clone(),
+                    path: chunk.path.clone(),
+                    heading_path: chunk.heading_path.clone(),
+                    char_start: chunk.char_start,
+                    char_end: chunk.char_end,
+                    statement,
+                    quote,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn reduce_facts(
+    app: &AppHandle,
+    settings: &Settings,
+    question: &str,
+    facts: &[ExtractedFact],
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<ExtractedFact>, String> {
+    if facts.len() <= 80 {
+        return Ok(facts.to_vec());
+    }
+    let mut source = String::new();
+    for (idx, fact) in facts.iter().enumerate() {
+        source.push_str(&format!(
+            "[F{}] chunk={} file={} heading={} statement={} quote={}\n",
+            idx + 1,
+            fact.chunk_id,
+            fact.file_name,
+            fact.heading_path,
+            fact.statement,
+            fact.quote
+        ));
+    }
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "重複した抽出事実を統合し、質問への回答に必要な事実を最大80件に整理してください。JSONだけで返してください。形式: {\"keep_indexes\":[1,2,3]}"
+        }),
+        json!({"role":"user","content":format!("質問:\n{}\n\nFACTS:\n{}", question, source)}),
+    ];
+    let content = call_deepseek(app, settings, messages, 1_200, true, false, Some(run_id), cancel).await?;
+    let parsed = serde_json::from_str::<JsonValue>(&content).unwrap_or_else(|_| json!({}));
+    let mut reduced = Vec::new();
+    if let Some(indexes) = parsed.get("keep_indexes").and_then(|v| v.as_array()) {
+        for index in indexes {
+            if let Some(i) = index.as_u64() {
+                if let Some(fact) = facts.get(i.saturating_sub(1) as usize) {
+                    reduced.push(fact.clone());
+                }
+            }
+        }
+    }
+    if reduced.is_empty() {
+        Ok(facts.iter().take(80).cloned().collect())
+    } else {
+        Ok(reduced)
+    }
+}
+
+async fn synthesize_answer(
+    app: &AppHandle,
+    settings: &Settings,
+    question: &str,
+    facts: &[ExtractedFact],
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    if facts.is_empty() {
+        return Ok("根拠が見つかりません。選択中のsource内に、この質問へ回答できる事実は抽出されませんでした。".to_string());
+    }
+    let mut source = String::new();
+    for (idx, fact) in facts.iter().enumerate() {
+        source.push_str(&format!(
+            "[F{}] file={} chunk={} chars={}-{} heading={}\nstatement: {}\nquote: {}\n\n",
+            idx + 1,
+            fact.file_name,
+            fact.chunk_id,
+            fact.char_start,
+            fact.char_end,
+            fact.heading_path,
+            fact.statement,
+            fact.quote
+        ));
+    }
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "あなたはローカル文書専用の回答エンジンです。FACTSだけを根拠に回答してください。各主要主張に [F1] のような出典を付けてください。FACTSにない情報は根拠不足としてください。"
+        }),
+        json!({
+            "role": "user",
+            "content": format!("質問:\n{}\n\nFACTS:\n{}\n\n要件:\n- 条件、例外、対象者、金額、期間、手続きを漏らさない\n- 文書間差分や矛盾があれば明示\n- source外推測は禁止\n- 日本語で回答", question, source)
+        }),
+    ];
+    call_deepseek(app, settings, messages, 2_500, false, true, Some(run_id), cancel).await
+}
+
+async fn audit_answer(
+    app: &AppHandle,
+    settings: &Settings,
+    answer: &str,
+    hits: &[SearchHit],
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let source = build_context_from_hits(hits, settings.max_context_chars);
+    let messages = vec![
+        json!({"role":"system","content":"回答の各主張がSOURCEに支えられているか検査し、JSONだけで返してください。形式: {\"unsupported_claims\":[\"...\"],\"verdict\":\"pass|warning|fail\"}"}),
+        json!({"role":"user","content":format!("ANSWER:\n{}\n\nSOURCE:\n{}", answer, source)}),
+    ];
+    call_deepseek(app, settings, messages, 1_000, true, false, Some(run_id), cancel).await
+}
+
+async fn audit_facts_answer(
+    app: &AppHandle,
+    settings: &Settings,
+    answer: &str,
+    facts: &[ExtractedFact],
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let mut source = String::new();
+    for (idx, fact) in facts.iter().enumerate() {
+        source.push_str(&format!("[F{}] {}\nquote: {}\n", idx + 1, fact.statement, fact.quote));
+    }
+    let messages = vec![
+        json!({"role":"system","content":"回答の各主張がFACTSに支えられているか検査し、JSONだけで返してください。形式: {\"unsupported_claims\":[\"...\"],\"verdict\":\"pass|warning|fail\"}"}),
+        json!({"role":"user","content":format!("ANSWER:\n{}\n\nFACTS:\n{}", answer, source)}),
+    ];
+    call_deepseek(app, settings, messages, 1_000, true, false, Some(run_id), cancel).await
+}
+
+async fn call_deepseek(
+    app: &AppHandle,
+    settings: &Settings,
+    messages: Vec<JsonValue>,
+    max_tokens: u32,
+    json_mode: bool,
+    stream: bool,
+    run_id: Option<&str>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let api_key = load_api_key()
+        .map_err(|_| "DeepSeek API key が未設定です。設定画面で保存してください。".to_string())?;
+    let client = reqwest::Client::new();
+    let mut body = json!({
+        "model": settings.model,
+        "messages": messages,
+        "temperature": settings.temperature,
+        "max_tokens": max_tokens,
+        "stream": stream,
+        "thinking": {"type": if settings.thinking_enabled { "enabled" } else { "disabled" }},
+        "reasoning_effort": settings.reasoning_effort
+    });
+    if json_mode {
+        body["response_format"] = json!({"type": "json_object"});
+    }
+
+    let mut attempt = 0usize;
+    loop {
+        if cancel.load(AtomicOrdering::SeqCst) {
+            return Err("処理をキャンセルしました。".to_string());
+        }
+        attempt += 1;
+        emit_api_status(app, run_id, "DeepSeekへ送信しています", attempt, true);
+        let response = client
+            .post("https://api.deepseek.com/chat/completions")
+            .bearer_auth(&api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("DeepSeek通信に失敗しました: {e}"))?;
+
+        if response.status().is_success() {
+            if stream {
+                return read_deepseek_stream(app, response, run_id, cancel).await;
+            }
+            let value = response
+                .json::<JsonValue>()
+                .await
+                .map_err(|e| format!("DeepSeek応答の解析に失敗しました: {e}"))?;
+            return Ok(value
+                .get("choices")
+                .and_then(|v| v.as_array())
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .and_then(|message| message.get("content"))
+                .and_then(|content| content.as_str())
+                .unwrap_or("")
+                .to_string());
+        }
+
+        let failure = classify_api_failure(response).await;
+        if failure.class_name == "rate_limit" && attempt <= 2 {
+            if let Some(wait_ms) = failure.retry_after_ms {
+                if wait_ms <= MAX_SHORT_RATE_WAIT_MS {
+                    emit_api_status(
+                        app,
+                        run_id,
+                        &format!("DeepSeek制限により{}秒待機しています", (wait_ms + 999) / 1000),
+                        attempt,
+                        true,
+                    );
+                    sleep(Duration::from_millis(wait_ms)).await;
+                    continue;
+                }
+            }
+        }
+
+        emit_api_status(
+            app,
+            run_id,
+            &format!("DeepSeek APIで停止しました: {}", failure.message),
+            attempt,
+            false,
+        );
+        return Err(format!("{}: {}", failure.class_name, failure.message));
+    }
+}
+
+async fn read_deepseek_stream(
+    app: &AppHandle,
+    response: reqwest::Response,
+    run_id: Option<&str>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut answer = String::new();
+    while let Some(item) = stream.next().await {
+        if cancel.load(AtomicOrdering::SeqCst) {
+            return Err("処理をキャンセルしました。".to_string());
+        }
+        let bytes = item.map_err(|e| format!("DeepSeek stream error: {e}"))?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim().to_string();
+            buffer = buffer[pos + 1..].to_string();
+            if !line.starts_with("data:") {
+                continue;
+            }
+            let data = line.trim_start_matches("data:").trim();
+            if data == "[DONE]" {
+                return Ok(answer);
+            }
+            if let Ok(value) = serde_json::from_str::<JsonValue>(data) {
+                if let Some(delta) = value
+                    .get("choices")
+                    .and_then(|v| v.as_array())
+                    .and_then(|choices| choices.first())
+                    .and_then(|choice| choice.get("delta"))
+                    .and_then(|delta| delta.get("content"))
+                    .and_then(|content| content.as_str())
+                {
+                    answer.push_str(delta);
+                    let _ = app.emit(
+                        "answer-delta",
+                        json!({
+                            "runId": run_id,
+                            "delta": delta
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    Ok(answer)
+}
+
+async fn classify_api_failure(response: reqwest::Response) -> ApiFailure {
+    let status = response.status();
+    let retry_after_ms = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_retry_after_ms);
+    let body = response.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<JsonValue>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| {
+            if body.trim().is_empty() {
+                status.to_string()
+            } else {
+                body
+            }
+        });
+    let class_name = match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "auth",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit",
+        StatusCode::BAD_REQUEST if message.to_lowercase().contains("context") => "context_limit",
+        StatusCode::PAYLOAD_TOO_LARGE => "context_limit",
+        s if s.is_server_error() => "server",
+        _ => "api_error",
+    }
+    .to_string();
+    ApiFailure {
+        class_name,
+        message,
+        retry_after_ms,
+    }
+}
+
+fn parse_retry_after_ms(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok().map(|seconds| seconds * 1000)
+}
+
+fn emit_api_status(app: &AppHandle, run_id: Option<&str>, message: &str, attempt: usize, can_cancel: bool) {
+    let _ = app.emit(
+        "task-progress",
+        ProgressPayload {
+            stage: "api".to_string(),
+            status: if can_cancel { "running" } else { "stopped" }.to_string(),
+            message: format!("{} (attempt {})", message, attempt),
+            run_id: run_id.map(ToString::to_string),
+            completed: attempt as u64,
+            total: 0,
+            elapsed_ms: 0,
+            can_cancel,
+        },
+    );
+}
+
+fn build_context_from_hits(hits: &[SearchHit], max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, hit) in hits.iter().enumerate() {
+        let block = format!(
+            "[S{}] file={} chunk={} chars={}-{} heading={}\n{}\n\n",
+            idx + 1,
+            hit.file_name,
+            hit.chunk_id,
+            hit.char_start,
+            hit.char_end,
+            hit.heading_path,
+            hit.snippet
+        );
+        if out.chars().count() + block.chars().count() > max_chars {
+            break;
+        }
+        out.push_str(&block);
+    }
+    out
+}
+
+fn insert_question(conn: &Connection, text: &str) -> Result<i64, String> {
+    conn.execute(
+        "INSERT INTO questions(text, created_at) VALUES (?1, ?2)",
+        params![text, Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn insert_run(
+    conn: &Connection,
+    run_id: &str,
+    question_id: i64,
+    mode: &str,
+    selected_document_ids: &[i64],
+) -> Result<(), String> {
+    conn.execute(
+        r#"
+        INSERT INTO retrieval_runs(id, question_id, mode, status, selected_document_ids, started_at)
+        VALUES (?1, ?2, ?3, 'running', ?4, ?5)
+        "#,
+        params![
+            run_id,
+            question_id,
+            mode,
+            serde_json::to_string(selected_document_ids).unwrap_or_else(|_| "[]".to_string()),
+            Utc::now().to_rfc3339()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn complete_run(conn: &Connection, run_id: &str, status: &str, error: Option<&str>) -> Result<(), String> {
+    conn.execute(
+        "UPDATE retrieval_runs SET status = ?1, completed_at = ?2, error = ?3 WHERE id = ?4",
+        params![status, Utc::now().to_rfc3339(), error, run_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn insert_fact(conn: &Connection, run_id: &str, fact: &ExtractedFact) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO extracted_facts(run_id, chunk_id, fact, quote, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![run_id, fact.chunk_id, fact.statement, fact.quote, Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn save_answer(conn: &Connection, run_id: &str, answer: &str, audit: Option<&str>) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO answers(run_id, answer, audit_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![run_id, answer, audit, Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn load_settings(conn: &Connection) -> Result<Settings, String> {
+    let mut settings = Settings::default();
+    settings.source_path = get_setting(conn, "source_path")?;
+    if let Some(model) = get_setting(conn, "model")? {
+        settings.model = model;
+    }
+    if let Some(value) = get_setting(conn, "thinking_enabled")? {
+        settings.thinking_enabled = value == "true";
+    }
+    if let Some(value) = get_setting(conn, "reasoning_effort")? {
+        settings.reasoning_effort = value;
+    }
+    if let Some(value) = get_setting(conn, "temperature")? {
+        settings.temperature = value.parse().unwrap_or(settings.temperature);
+    }
+    if let Some(value) = get_setting(conn, "max_context_chars")? {
+        settings.max_context_chars = value.parse().unwrap_or(settings.max_context_chars);
+    }
+    if let Some(value) = get_setting(conn, "comprehensive_batch_chars")? {
+        settings.comprehensive_batch_chars = value.parse().unwrap_or(settings.comprehensive_batch_chars);
+    }
+    Ok(settings)
+}
+
+fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn load_documents(conn: &Connection) -> Result<Vec<DocumentInfo>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT d.id, d.path, d.file_name, d.size, d.mtime_ms, d.sha256, d.char_count,
+                   d.selected, d.indexed_at, d.status, d.error, COUNT(c.id) AS chunk_count
+            FROM documents d
+            LEFT JOIN chunks c ON c.document_id = d.id
+            GROUP BY d.id
+            ORDER BY d.file_name
+            "#,
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(DocumentInfo {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                file_name: row.get(2)?,
+                size: row.get(3)?,
+                mtime_ms: row.get(4)?,
+                sha256: row.get(5)?,
+                char_count: row.get(6)?,
+                selected: row.get::<_, i64>(7)? == 1,
+                indexed_at: row.get(8)?,
+                status: row.get(9)?,
+                error: row.get(10)?,
+                chunk_count: row.get(11)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+fn load_stats(conn: &Connection) -> Result<AppStats, String> {
+    let document_count = scalar_i64(conn, "SELECT COUNT(*) FROM documents")?;
+    let selected_document_count = scalar_i64(conn, "SELECT COUNT(*) FROM documents WHERE selected = 1")?;
+    let total_chars = scalar_i64(conn, "SELECT COALESCE(SUM(char_count), 0) FROM documents")?;
+    let selected_chars = scalar_i64(conn, "SELECT COALESCE(SUM(char_count), 0) FROM documents WHERE selected = 1")?;
+    let chunk_count = scalar_i64(conn, "SELECT COUNT(*) FROM chunks")?;
+    let embedding_count = scalar_i64(conn, "SELECT COUNT(*) FROM chunk_embeddings")?;
+    Ok(AppStats {
+        document_count,
+        selected_document_count,
+        total_chars,
+        selected_chars,
+        chunk_count,
+        embedding_count,
+    })
+}
+
+fn scalar_i64(conn: &Connection, sql: &str) -> Result<i64, String> {
+    conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())
+}
+
+fn mark_missing_documents(conn: &Connection, found_paths: &HashSet<String>) -> Result<(), String> {
+    let documents = load_documents(conn)?;
+    for doc in documents {
+        if !found_paths.contains(&doc.path) {
+            conn.execute(
+                "UPDATE documents SET status = 'missing', error = 'sourceから見つかりません' WHERE id = ?1",
+                params![doc.id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn record_document_error(conn: &Connection, path: &Path, error: &str) -> Result<(), String> {
+    let path_string = path.to_string_lossy().to_string();
+    let file_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    conn.execute(
+        r#"
+        INSERT INTO documents(path, file_name, status, error)
+        VALUES (?1, ?2, 'error', ?3)
+        ON CONFLICT(path) DO UPDATE SET status = 'error', error = excluded.error
+        "#,
+        params![path_string, file_name, error],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn log_event(
+    conn: &Connection,
+    operation: &str,
+    status: &str,
+    message: &str,
+    run_id: Option<&str>,
+    metadata: JsonValue,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO logs(timestamp, operation, status, message, run_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            Utc::now().to_rfc3339(),
+            operation,
+            status,
+            message,
+            run_id,
+            metadata.to_string()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn save_api_key(api_key: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| e.to_string())?;
+    entry.set_password(api_key).map_err(|e| e.to_string())
+}
+
+fn load_api_key() -> Result<String, String> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| e.to_string())?;
+    entry.get_password().map_err(|e| e.to_string())
+}
+
+fn delete_api_key() -> Result<(), String> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| e.to_string())?;
+    match entry.delete_credential() {
+        Ok(_) => Ok(()),
+        Err(_) => Ok(()),
+    }
+}
+
+fn emit_progress(
+    app: &AppHandle,
+    started: Instant,
+    stage: &str,
+    status: &str,
+    message: &str,
+    run_id: Option<String>,
+    completed: u64,
+    total: u64,
+    can_cancel: bool,
+) {
+    let _ = app.emit(
+        "task-progress",
+        ProgressPayload {
+            stage: stage.to_string(),
+            status: status.to_string(),
+            message: message.to_string(),
+            run_id,
+            completed,
+            total,
+            elapsed_ms: started.elapsed().as_millis(),
+            can_cancel,
+        },
+    );
+}
+
+fn placeholders(count: usize) -> String {
+    (0..count).map(|_| "?").collect::<Vec<_>>().join(",")
+}
+
+fn extract_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut current_kind = 0u8;
+    for ch in text.chars() {
+        let kind = token_kind(ch);
+        if kind == 0 {
+            flush_token(&mut terms, &current, current_kind);
+            current.clear();
+            current_kind = 0;
+            continue;
+        }
+        if current_kind != 0 && current_kind != kind {
+            flush_token(&mut terms, &current, current_kind);
+            current.clear();
+        }
+        current.push(ch);
+        current_kind = kind;
+    }
+    flush_token(&mut terms, &current, current_kind);
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn flush_token(terms: &mut Vec<String>, token: &str, kind: u8) {
+    if token.trim().is_empty() {
+        return;
+    }
+    let normalized = if kind == 1 {
+        token.to_ascii_lowercase()
+    } else {
+        token.to_string()
+    };
+    let chars: Vec<char> = normalized.chars().collect();
+    if chars.len() >= 2 && chars.len() <= 40 {
+        terms.push(normalized.clone());
+    }
+    if kind != 1 {
+        for n in [2usize, 3usize] {
+            if chars.len() >= n {
+                for gram in chars.windows(n) {
+                    terms.push(gram.iter().collect());
+                }
+            }
+        }
+    }
+}
+
+fn token_kind(ch: char) -> u8 {
+    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+        return 1;
+    }
+    let code = ch as u32;
+    if (0x3040..=0x30ff).contains(&code)
+        || (0x3400..=0x9fff).contains(&code)
+        || (0xf900..=0xfaff).contains(&code)
+        || (0xff66..=0xff9f).contains(&code)
+    {
+        return 2;
+    }
+    0
+}
+
+fn term_weights(text: &str) -> HashMap<String, f64> {
+    let mut weights = HashMap::new();
+    for term in extract_terms(text) {
+        let len = term.chars().count() as f64;
+        let weight = if len >= 4.0 { 2.0 } else { 1.0 };
+        *weights.entry(term).or_insert(0.0) += weight;
+    }
+    weights
+}
+
+fn embedding_for_text(text: &str) -> Vec<f32> {
+    let mut vector = vec![0f32; EMBEDDING_DIMS];
+    for (term, weight) in term_weights(text) {
+        let digest = Sha256::digest(term.as_bytes());
+        let index = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) as usize % EMBEDDING_DIMS;
+        let sign = if digest[4] & 1 == 0 { 1.0 } else { -1.0 };
+        vector[index] += sign * weight as f32;
+    }
+    normalize_vector(&mut vector);
+    vector
+}
+
+fn normalize_vector(vector: &mut [f32]) {
+    let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in vector.iter_mut() {
+            *value /= norm;
+        }
+    }
+}
+
+fn encode_vector(vector: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+fn decode_vector(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn dot_product(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (*x as f64) * (*y as f64))
+        .sum()
+}
+
+fn exact_bonus(query: &str, terms: &[String], text: &str) -> f64 {
+    let mut bonus: f64 = 0.0;
+    if !query.trim().is_empty() && text.contains(query.trim()) {
+        bonus += 0.18;
+    }
+    for term in terms.iter().take(30) {
+        if term.chars().count() >= 2 && text.contains(term) {
+            bonus += if term.chars().count() >= 4 { 0.045 } else { 0.02 };
+        }
+    }
+    bonus.min(0.45)
+}
+
+fn make_snippet(content: &str, terms: &[String], max_chars: usize) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= max_chars {
+        return content.to_string();
+    }
+    let mut hit_index = 0usize;
+    for term in terms {
+        if term.chars().count() < 2 {
+            continue;
+        }
+        if let Some(byte_pos) = content.find(term) {
+            hit_index = content[..byte_pos].chars().count();
+            break;
+        }
+    }
+    let start = hit_index.saturating_sub(max_chars / 3);
+    let end = (start + max_chars).min(chars.len());
+    let mut snippet: String = chars[start..end].iter().collect();
+    if start > 0 {
+        snippet.insert_str(0, "...");
+    }
+    if end < chars.len() {
+        snippet.push_str("...");
+    }
+    snippet
+}
+
+fn diversify_hits(hits: &mut Vec<SearchHit>, limit: usize) {
+    let mut by_doc: HashMap<i64, usize> = HashMap::new();
+    for hit in hits.iter_mut() {
+        let count = by_doc.entry(hit.document_id).or_insert(0);
+        if *count >= 3 {
+            hit.score *= 0.86;
+        }
+        *count += 1;
+    }
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    if hits.len() > limit * 3 {
+        hits.truncate(limit * 3);
+    }
+}
