@@ -44,16 +44,31 @@ document.querySelector("#app").innerHTML = `
     <div class="window-drag-region" data-tauri-drag-region></div>
     <aside class="sidebar source-sidebar">
       <section class="source-panel">
-        <div class="source-head">
-          <h2>資料</h2>
-          <button id="chooseSourceButton" type="button">フォルダ選択</button>
+        <div class="source-toolbar">
+          <span class="source-kicker">資料</span>
+          <div class="source-tool-buttons">
+            <button id="chooseSourceButton" class="source-icon-button" type="button" title="フォルダ選択" aria-label="フォルダ選択">
+              <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z"></path>
+              </svg>
+            </button>
+            <button id="indexButton" class="source-icon-button primary-icon" type="button" title="更新" aria-label="更新">
+              <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M21 12a9 9 0 0 1-15.3 6.4"></path>
+                <path d="M3 12A9 9 0 0 1 18.3 5.6"></path>
+                <path d="M18 2v4h-4"></path>
+                <path d="M6 22v-4h4"></path>
+              </svg>
+            </button>
+          </div>
         </div>
         <div id="sourcePath" class="path-box">未設定</div>
-        <div id="stats" class="stats compact"></div>
-        <div class="source-actions">
-          <button id="indexButton" class="primary" type="button">更新</button>
-          <button id="selectAllButton" type="button">全選択</button>
-          <button id="clearSelectionButton" type="button">解除</button>
+        <div class="source-list-head">
+          <div id="stats" class="stats compact"></div>
+          <div class="source-selection-actions">
+            <button id="selectAllButton" class="text-button" type="button">全選択</button>
+            <button id="clearSelectionButton" class="text-button" type="button">解除</button>
+          </div>
         </div>
         <div id="fileList" class="file-list"></div>
       </section>
@@ -233,8 +248,7 @@ function renderSnapshot() {
 
 function renderStats(stats) {
   els.stats.innerHTML = `
-    <span>選択 ${formatNumber(stats.selectedDocumentCount)} / ${formatNumber(stats.documentCount)}</span>
-    <span>${formatNumber(stats.selectedChars)}字</span>
+    <span>選択 ${formatNumber(stats.selectedDocumentCount)} / ${formatNumber(stats.documentCount)} ・ ${formatNumber(stats.selectedChars)}字</span>
   `;
 }
 

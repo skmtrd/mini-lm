@@ -161,7 +161,7 @@ button.primary {
 
 .history-sidebar {
   overflow: auto;
-  padding: 14px;
+  padding: 18px 14px 14px;
   border-left: 1px solid #d8e0e6;
   background: #f2f5f7;
 }
@@ -333,61 +333,111 @@ button.primary {
 
 .source-panel {
   display: grid;
-  gap: 10px;
+  gap: 9px;
 }
 
-.source-head,
-.source-actions,
 .composer-actions {
   display: flex;
   gap: 8px;
   align-items: center;
 }
 
-.source-head {
+.source-toolbar {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
   justify-content: space-between;
+  gap: 10px;
 }
 
-.source-head h2 {
-  margin: 0;
-  font-size: 16px;
+.source-kicker {
+  color: #667582;
+  font-size: 12px;
+  font-weight: 700;
   letter-spacing: 0;
 }
 
-.path-box {
-  min-height: 36px;
-  border: 1px solid #d8e0e6;
-  border-radius: 6px;
-  padding: 8px;
-  overflow-wrap: anywhere;
+.source-tool-buttons,
+.source-selection-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.source-icon-button {
+  display: inline-grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-color: transparent;
+  padding: 0;
+  background: transparent;
+  color: #4d5c68;
+}
+
+.source-icon-button:hover:not(:disabled) {
+  border-color: #cbd5dc;
   background: #ffffff;
+}
+
+.source-icon-button.primary-icon {
+  color: #126b61;
+}
+
+.source-icon-button .action-icon {
+  width: 17px;
+  height: 17px;
+}
+
+.path-box {
+  min-height: 30px;
+  border: 1px solid #dde5ea;
+  border-radius: 6px;
+  padding: 6px 8px;
+  overflow-wrap: anywhere;
+  background: rgb(255 255 255 / 64%);
+  color: #667582;
+  font-size: 12px;
+}
+
+.source-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 28px;
+}
+
+.stats.compact {
+  min-width: 0;
+}
+
+.stats.compact span {
+  display: block;
+  overflow: hidden;
+  color: #667582;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.text-button {
+  border-color: transparent;
+  padding: 3px 5px;
+  background: transparent;
   color: #4d5c68;
   font-size: 12px;
 }
 
-.stats.compact {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.stats.compact span {
-  border: 1px solid #d8e0e6;
-  border-radius: 999px;
-  padding: 3px 8px;
-  background: #ffffff;
-  color: #566674;
-  font-size: 12px;
-}
-
-.source-actions {
-  justify-content: flex-start;
-  flex-wrap: wrap;
+.text-button:hover:not(:disabled) {
+  border-color: transparent;
+  background: transparent;
+  color: #126b61;
 }
 
 .file-list {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .file-row {
@@ -397,7 +447,7 @@ button.primary {
   align-items: start;
   border: 1px solid #d8e0e6;
   border-radius: 6px;
-  padding: 8px;
+  padding: 7px;
   background: #ffffff;
 }
 
