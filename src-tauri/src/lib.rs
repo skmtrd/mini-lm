@@ -4843,23 +4843,43 @@ fn log_event(
 }
 
 fn save_api_key(conn: &Connection, api_key: &str) -> Result<String, String> {
-    match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER)
-        .map_err(|e| e.to_string())
-        .and_then(|entry| entry.set_password(api_key).map_err(|e| e.to_string()))
-    {
-        Ok(_) => {
+    let api_key = api_key.trim();
+    let entry = match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
+        Ok(entry) => entry,
+        Err(error) => return save_api_key_fallback(conn, api_key, &error.to_string()),
+    };
+
+    if let Err(error) = entry.set_password(api_key) {
+        return save_api_key_fallback(conn, api_key, &format!("keychain save failed: {error}"));
+    }
+
+    match entry.get_password() {
+        Ok(saved) if saved.trim() == api_key => {
             delete_setting(conn, "api_key_plaintext")?;
             delete_setting(conn, "api_key_keychain_error")?;
             set_setting(conn, "api_key_storage", "os-keychain")?;
             Ok("os-keychain".to_string())
         }
+        Ok(_) => {
+            let _ = entry.delete_credential();
+            save_api_key_fallback(conn, api_key, "keychain verification mismatch")
+        }
         Err(error) => {
-            set_setting(conn, "api_key_plaintext", api_key)?;
-            set_setting(conn, "api_key_storage", "sqlite-plaintext-fallback")?;
-            set_setting(conn, "api_key_keychain_error", &error)?;
-            Ok("sqlite-plaintext-fallback".to_string())
+            let _ = entry.delete_credential();
+            save_api_key_fallback(
+                conn,
+                api_key,
+                &format!("keychain verification failed: {error}"),
+            )
         }
     }
+}
+
+fn save_api_key_fallback(conn: &Connection, api_key: &str, error: &str) -> Result<String, String> {
+    set_setting(conn, "api_key_plaintext", api_key)?;
+    set_setting(conn, "api_key_storage", "sqlite-plaintext-fallback")?;
+    set_setting(conn, "api_key_keychain_error", error)?;
+    Ok("sqlite-plaintext-fallback".to_string())
 }
 
 fn load_api_key(conn: &Connection) -> (Option<String>, String) {
