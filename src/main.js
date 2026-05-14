@@ -165,7 +165,8 @@ function wireEvents() {
   });
   els.newChatButton.addEventListener("click", startNewChat);
   document.addEventListener("click", (event) => {
-    if (!state.openHistoryMenuId || event.target.closest(".history-sidebar")) return;
+    if (!state.openHistoryMenuId) return;
+    if (event.target.closest("[data-archived-menu-id]") || event.target.closest(".history-menu")) return;
     state.openHistoryMenuId = null;
     renderChatSidebar();
   });
