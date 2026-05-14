@@ -572,6 +572,7 @@ fn init_db(state: &AppStateInner) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     ensure_default_evaluation_items(&conn)?;
+    backfill_missing_hierarchy_contexts(&conn)?;
     Ok(())
 }
 
@@ -1530,6 +1531,81 @@ fn rebuild_hierarchy_contexts(
     .map_err(|e| e.to_string())?;
 
     let _ = path;
+    Ok(())
+}
+
+fn backfill_missing_hierarchy_contexts(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT d.id, d.file_name, d.path, d.char_count
+            FROM documents d
+            LEFT JOIN document_contexts dc ON dc.document_id = d.id
+            WHERE d.status = 'indexed' AND dc.document_id IS NULL
+            ORDER BY d.file_name
+            "#,
+        )
+        .map_err(|e| e.to_string())?;
+    let docs = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    for (document_id, file_name, path, char_count) in docs {
+        let mut chunk_stmt = conn
+            .prepare(
+                r#"
+                SELECT id, char_start, char_end, heading_path, content
+                FROM chunks
+                WHERE document_id = ?1
+                ORDER BY char_start, id
+                "#,
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = chunk_stmt
+            .query_map(params![document_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    ChunkDraft {
+                        char_start: row.get(1)?,
+                        char_end: row.get(2)?,
+                        heading_path: row.get(3)?,
+                        content: row.get(4)?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let pairs = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        if pairs.is_empty() {
+            continue;
+        }
+        let chunk_ids = pairs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let chunks = pairs.into_iter().map(|(_, chunk)| chunk).collect::<Vec<_>>();
+        conn.execute("DELETE FROM section_contexts WHERE document_id = ?1", params![document_id])
+            .map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM document_contexts WHERE document_id = ?1", params![document_id])
+            .map_err(|e| e.to_string())?;
+        rebuild_hierarchy_contexts(
+            conn,
+            document_id,
+            &file_name,
+            &path,
+            char_count,
+            &chunks,
+            &chunk_ids,
+            &Utc::now().to_rfc3339(),
+        )?;
+    }
     Ok(())
 }
 
@@ -4367,6 +4443,12 @@ mod tests {
         assert!(context.contains("DOCUMENT parents"));
         assert!(context.contains("SECTION parents"));
         assert!(context.contains("扶養手当") || context.contains("住宅手当"));
+
+        conn.execute("DELETE FROM section_contexts", []).unwrap();
+        conn.execute("DELETE FROM document_contexts", []).unwrap();
+        backfill_missing_hierarchy_contexts(&conn).unwrap();
+        assert!(scalar_i64(&conn, "SELECT COUNT(*) FROM section_contexts").unwrap() >= 2);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM document_contexts").unwrap(), 1);
     }
 
     #[test]
