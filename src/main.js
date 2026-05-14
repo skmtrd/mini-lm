@@ -74,7 +74,7 @@ document.querySelector("#app").innerHTML = `
           <span>Comprehensive batch chars</span>
           <input id="batchCharsInput" type="number" min="2000" max="16000" step="500" value="6000" />
         </label>
-        <p class="warning">APIキーはOSのKeychain/Credential Managerへ保存します。ログやDBには保存しません。</p>
+        <p id="apiStorageWarning" class="warning">APIキーはOSのKeychain/Credential Managerへ保存します。</p>
       </section>
 
       <section class="panel source-panel">
@@ -154,6 +154,7 @@ const els = {
   appStateBadge: $("#appStateBadge"),
   apiKeyInput: $("#apiKeyInput"),
   apiKeyStatus: $("#apiKeyStatus"),
+  apiStorageWarning: $("#apiStorageWarning"),
   modelInput: $("#modelInput"),
   thinkingInput: $("#thinkingInput"),
   reasoningInput: $("#reasoningInput"),
@@ -236,7 +237,7 @@ async function refreshSnapshot() {
 function renderSnapshot() {
   const { settings, documents, stats } = state.snapshot;
   els.appStateBadge.textContent = documents.length ? "読込済み" : "未読込";
-  els.apiKeyStatus.textContent = settings.apiKeySaved ? "APIキー保存済み" : "APIキー未保存";
+  renderApiKeyStatus(settings);
   els.modelInput.value = settings.model || "deepseek-v4-flash";
   els.thinkingInput.value = String(Boolean(settings.thinkingEnabled));
   els.reasoningInput.value = settings.reasoningEffort || "high";
@@ -246,6 +247,34 @@ function renderSnapshot() {
   els.sourcePath.textContent = settings.sourcePath || "未設定";
   renderStats(stats);
   renderFileList(documents);
+}
+
+function renderApiKeyStatus(settings) {
+  if (!settings.apiKeySaved) {
+    els.apiKeyStatus.textContent = "APIキー未保存";
+    els.apiStorageWarning.textContent = "APIキーはOSのKeychain/Credential Managerへ保存します。";
+    els.apiStorageWarning.className = "warning";
+    return;
+  }
+
+  if (settings.apiKeyStorage === "os-keychain") {
+    els.apiKeyStatus.textContent = "APIキー保存済み（OS安全領域）";
+    els.apiStorageWarning.textContent = "APIキーはOSのKeychain/Credential Managerに保存されています。";
+    els.apiStorageWarning.className = "warning ok-text";
+    return;
+  }
+
+  if (settings.apiKeyStorage === "sqlite-plaintext-fallback") {
+    els.apiKeyStatus.textContent = "APIキー保存済み（平文フォールバック）";
+    els.apiStorageWarning.textContent =
+      "OSの安全領域に保存できなかったため、SQLiteに平文で保存しています。この端末内だけで使ってください。";
+    els.apiStorageWarning.className = "warning bad-text";
+    return;
+  }
+
+  els.apiKeyStatus.textContent = `APIキー保存済み（${settings.apiKeyStorage}）`;
+  els.apiStorageWarning.textContent = "APIキー保存状態を確認してください。";
+  els.apiStorageWarning.className = "warning";
 }
 
 function renderStats(stats) {

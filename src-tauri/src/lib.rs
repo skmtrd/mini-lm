@@ -93,6 +93,8 @@ struct Settings {
     comprehensive_batch_chars: usize,
     api_key_saved: bool,
     api_key_storage: String,
+    #[serde(skip_serializing, skip_deserializing)]
+    api_key: Option<String>,
 }
 
 impl Default for Settings {
@@ -106,7 +108,8 @@ impl Default for Settings {
             max_context_chars: DEFAULT_CONTEXT_CHARS,
             comprehensive_batch_chars: DEFAULT_BATCH_CHARS,
             api_key_saved: false,
-            api_key_storage: "os-keychain".to_string(),
+            api_key_storage: "none".to_string(),
+            api_key: None,
         }
     }
 }
@@ -443,8 +446,7 @@ fn init_db(state: &AppStateInner) -> Result<(), String> {
 #[tauri::command]
 fn get_app_snapshot(state: State<'_, AppStateInner>) -> Result<AppSnapshot, String> {
     let conn = state.conn()?;
-    let mut settings = load_settings(&conn)?;
-    settings.api_key_saved = load_api_key().is_ok();
+    let settings = load_settings(&conn)?;
     Ok(AppSnapshot {
         settings,
         documents: load_documents(&conn)?,
@@ -476,16 +478,14 @@ fn save_settings(update: SettingsUpdate, state: State<'_, AppStateInner>) -> Res
     )?;
 
     if update.clear_api_key {
-        delete_api_key()?;
+        delete_api_key(&conn)?;
     } else if let Some(api_key) = update.api_key.as_deref() {
         if !api_key.trim().is_empty() {
-            save_api_key(api_key.trim())?;
+            save_api_key(&conn, api_key.trim())?;
         }
     }
 
-    let mut settings = load_settings(&conn)?;
-    settings.api_key_saved = load_api_key().is_ok();
-    Ok(settings)
+    load_settings(&conn)
 }
 
 #[tauri::command]
@@ -703,8 +703,7 @@ async fn answer_question_inner(
 
     let settings = {
         let conn = state.conn()?;
-        let mut loaded = load_settings(&conn)?;
-        loaded.api_key_saved = load_api_key().is_ok();
+        let loaded = load_settings(&conn)?;
         let question_id = insert_question(&conn, &request.question)?;
         insert_run(
             &conn,
@@ -1973,8 +1972,11 @@ async fn call_deepseek(
     run_id: Option<&str>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<String, String> {
-    let api_key = load_api_key()
-        .map_err(|_| "DeepSeek API key が未設定です。設定画面で保存してください。".to_string())?;
+    let api_key = settings
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| "DeepSeek API key が未設定です。設定画面で保存してください。".to_string())?;
     let client = reqwest::Client::new();
     let mut body = json!({
         "model": settings.model,
@@ -1998,7 +2000,7 @@ async fn call_deepseek(
         emit_api_status(app, run_id, "DeepSeekへ送信しています", attempt, true);
         let response = client
             .post("https://api.deepseek.com/chat/completions")
-            .bearer_auth(&api_key)
+            .bearer_auth(api_key)
             .json(&body)
             .send()
             .await
@@ -2261,6 +2263,10 @@ fn load_settings(conn: &Connection) -> Result<Settings, String> {
     if let Some(value) = get_setting(conn, "comprehensive_batch_chars")? {
         settings.comprehensive_batch_chars = value.parse().unwrap_or(settings.comprehensive_batch_chars);
     }
+    let (api_key, api_key_storage) = load_api_key(conn);
+    settings.api_key_saved = api_key.is_some();
+    settings.api_key_storage = api_key_storage;
+    settings.api_key = api_key;
     Ok(settings)
 }
 
@@ -2278,6 +2284,12 @@ fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> 
         params![key, value],
     )
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn delete_setting(conn: &Connection, key: &str) -> Result<(), String> {
+    conn.execute("DELETE FROM settings WHERE key = ?1", params![key])
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2393,22 +2405,51 @@ fn log_event(
     Ok(())
 }
 
-fn save_api_key(api_key: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| e.to_string())?;
-    entry.set_password(api_key).map_err(|e| e.to_string())
-}
-
-fn load_api_key() -> Result<String, String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| e.to_string())?;
-    entry.get_password().map_err(|e| e.to_string())
-}
-
-fn delete_api_key() -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| e.to_string())?;
-    match entry.delete_credential() {
-        Ok(_) => Ok(()),
-        Err(_) => Ok(()),
+fn save_api_key(conn: &Connection, api_key: &str) -> Result<String, String> {
+    match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER)
+        .map_err(|e| e.to_string())
+        .and_then(|entry| entry.set_password(api_key).map_err(|e| e.to_string()))
+    {
+        Ok(_) => {
+            delete_setting(conn, "api_key_plaintext")?;
+            delete_setting(conn, "api_key_keychain_error")?;
+            set_setting(conn, "api_key_storage", "os-keychain")?;
+            Ok("os-keychain".to_string())
+        }
+        Err(error) => {
+            set_setting(conn, "api_key_plaintext", api_key)?;
+            set_setting(conn, "api_key_storage", "sqlite-plaintext-fallback")?;
+            set_setting(conn, "api_key_keychain_error", &error)?;
+            Ok("sqlite-plaintext-fallback".to_string())
+        }
     }
+}
+
+fn load_api_key(conn: &Connection) -> (Option<String>, String) {
+    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
+        if let Ok(password) = entry.get_password() {
+            if !password.trim().is_empty() {
+                return (Some(password), "os-keychain".to_string());
+            }
+        }
+    }
+
+    match get_setting(conn, "api_key_plaintext") {
+        Ok(Some(value)) if !value.trim().is_empty() => {
+            (Some(value), "sqlite-plaintext-fallback".to_string())
+        }
+        _ => (None, "none".to_string()),
+    }
+}
+
+fn delete_api_key(conn: &Connection) -> Result<(), String> {
+    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
+        let _ = entry.delete_credential();
+    }
+    delete_setting(conn, "api_key_plaintext")?;
+    delete_setting(conn, "api_key_keychain_error")?;
+    set_setting(conn, "api_key_storage", "none")?;
+    Ok(())
 }
 
 fn emit_progress(

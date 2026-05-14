@@ -163,6 +163,14 @@ textarea {
   font-size: 12px;
 }
 
+.ok-text {
+  color: #0f766e;
+}
+
+.bad-text {
+  color: #a01818;
+}
+
 .path-box {
   margin: 10px 0;
   min-height: 38px;

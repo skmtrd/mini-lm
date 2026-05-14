@@ -12,7 +12,7 @@ Windows / macOS 両対応を目標にした、ローカルテキスト専用の 
 - DB: SQLite + FTS5
 - Vector: ローカル日本語n-gram hash embedding
 - LLM: DeepSeek Chat Completions API
-- API key: OS Keychain / Credential Manager
+- API key: OS Keychain / Credential Manager。保存できない環境ではSQLite平文フォールバックを明示して使う。
 
 ## 開発実行
 
@@ -96,7 +96,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 既定モデルは `deepseek-v4-flash` です。設定画面で `deepseek-v4-pro` も選べます。
 
-DeepSeek APIはOpenAI互換形式の `/chat/completions` を使います。API keyはOSの安全な保存領域へ保存し、SQLiteやログへは保存しません。
+DeepSeek APIはOpenAI互換形式の `/chat/completions` を使います。API keyはOSの安全な保存領域へ保存します。OS Keychain / Credential Managerが使えない環境では、アプリがSQLite平文フォールバックへ切り替え、画面に警告を表示します。ログにはAPI keyを保存しません。
 
 ## ローカルデータ
 
