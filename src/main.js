@@ -72,6 +72,13 @@ document.querySelector("#app").innerHTML = `
         </div>
         <div id="fileList" class="file-list"></div>
       </section>
+      <button id="settingsButton" class="settings-button" type="button" title="設定" aria-label="設定">
+        <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+          <path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5z"></path>
+          <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1A2 2 0 0 1 4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.3 7A2 2 0 0 1 7.1 4.2l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1A2 2 0 0 1 19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1a2 2 0 0 1 0 4H21a1.7 1.7 0 0 0-1.6 1z"></path>
+        </svg>
+        <span>設定</span>
+      </button>
     </aside>
 
     <main class="main">
@@ -114,6 +121,24 @@ document.querySelector("#app").innerHTML = `
       </button>
       <div id="historyList" class="history-list"></div>
     </aside>
+
+    <div id="settingsOverlay" class="settings-overlay" hidden>
+      <form id="settingsForm" class="settings-dialog" aria-labelledby="settingsTitle">
+        <div class="settings-dialog-head">
+          <h2 id="settingsTitle">設定</h2>
+          <button id="settingsCloseButton" class="modal-close-button" type="button" title="閉じる" aria-label="閉じる">×</button>
+        </div>
+        <label class="settings-field">
+          <span>DeepSeek APIキー</span>
+          <input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false" placeholder="sk-..." />
+        </label>
+        <p id="apiKeyStatus" class="settings-status"></p>
+        <div class="settings-dialog-actions">
+          <button id="clearApiKeyButton" class="text-button danger-text" type="button">削除</button>
+          <button id="saveSettingsButton" class="primary" type="submit">保存</button>
+        </div>
+      </form>
+    </div>
   </div>
 `;
 
@@ -123,6 +148,7 @@ const els = {
   sidebar: $(".sidebar"),
   chooseSourceButton: $("#chooseSourceButton"),
   sourcePath: $("#sourcePath"),
+  settingsButton: $("#settingsButton"),
   indexButton: $("#indexButton"),
   selectAllButton: $("#selectAllButton"),
   clearSelectionButton: $("#clearSelectionButton"),
@@ -138,6 +164,13 @@ const els = {
   toastRegion: $("#toastRegion"),
   historySidebar: $(".history-sidebar"),
   historyList: $("#historyList"),
+  settingsOverlay: $("#settingsOverlay"),
+  settingsForm: $("#settingsForm"),
+  settingsCloseButton: $("#settingsCloseButton"),
+  apiKeyInput: $("#apiKeyInput"),
+  apiKeyStatus: $("#apiKeyStatus"),
+  clearApiKeyButton: $("#clearApiKeyButton"),
+  saveSettingsButton: $("#saveSettingsButton"),
 };
 
 init();
@@ -160,6 +193,16 @@ async function init() {
 }
 
 function wireEvents() {
+  els.settingsButton.addEventListener("click", openSettingsDialog);
+  els.settingsCloseButton.addEventListener("click", closeSettingsDialog);
+  els.settingsOverlay.addEventListener("click", (event) => {
+    if (event.target === els.settingsOverlay) closeSettingsDialog();
+  });
+  els.settingsForm.addEventListener("submit", saveApiKey);
+  els.clearApiKeyButton.addEventListener("click", clearApiKey);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !els.settingsOverlay.hidden) closeSettingsDialog();
+  });
   els.chooseSourceButton.addEventListener("click", chooseSourceDirectory);
   els.indexButton.addEventListener("click", indexSource);
   els.selectAllButton.addEventListener("click", async () => {
@@ -244,6 +287,7 @@ function renderSnapshot() {
   els.sourcePath.textContent = settings.sourcePath || "未設定";
   renderStats(stats);
   renderFileList(documents);
+  renderApiKeyStatus();
 }
 
 function renderStats(stats) {
@@ -330,6 +374,11 @@ async function indexSource() {
 async function answerQuestion() {
   const question = els.questionInput.value.trim();
   if (!question || state.busy) return;
+  if (!state.snapshot?.settings?.apiKeySaved) {
+    openSettingsDialog();
+    showToast("DeepSeek APIキーを設定してください", "", "info");
+    return;
+  }
 
   setBusy(true);
   promoteCurrentArchivedChat();
@@ -398,6 +447,104 @@ async function answerQuestion() {
 
 function selectedDocumentIds() {
   return (state.snapshot?.documents || []).filter((doc) => doc.selected).map((doc) => doc.id);
+}
+
+function openSettingsDialog() {
+  if (state.busy) return;
+  renderApiKeyStatus();
+  els.apiKeyInput.value = "";
+  els.settingsOverlay.hidden = false;
+  window.setTimeout(() => els.apiKeyInput.focus(), 0);
+}
+
+function closeSettingsDialog() {
+  els.settingsOverlay.hidden = true;
+  els.apiKeyInput.value = "";
+}
+
+async function saveApiKey(event) {
+  event.preventDefault();
+  const apiKey = els.apiKeyInput.value.trim();
+  if (!apiKey) {
+    showToast("APIキーを入力してください", "", "info");
+    return;
+  }
+
+  setSettingsSaving(true);
+  try {
+    const settings = await invoke("save_settings", {
+      update: buildSettingsUpdate({ apiKey }),
+    });
+    state.snapshot = {
+      ...state.snapshot,
+      settings,
+    };
+    renderApiKeyStatus();
+    closeSettingsDialog();
+    showToast("APIキーを保存しました", "", "success");
+  } catch (error) {
+    showToast("APIキーの保存に失敗しました", String(error), "error");
+  } finally {
+    setSettingsSaving(false);
+  }
+}
+
+async function clearApiKey() {
+  if (state.busy || !state.snapshot?.settings?.apiKeySaved) return;
+
+  setSettingsSaving(true);
+  try {
+    const settings = await invoke("save_settings", {
+      update: buildSettingsUpdate({ clearApiKey: true }),
+    });
+    state.snapshot = {
+      ...state.snapshot,
+      settings,
+    };
+    els.apiKeyInput.value = "";
+    renderApiKeyStatus();
+    showToast("APIキーを削除しました", "", "success");
+  } catch (error) {
+    showToast("APIキーの削除に失敗しました", String(error), "error");
+  } finally {
+    setSettingsSaving(false);
+  }
+}
+
+function buildSettingsUpdate(options = {}) {
+  const settings = state.snapshot?.settings || {};
+  return {
+    model: settings.model || "deepseek-v4-flash",
+    thinkingEnabled: false,
+    reasoningEffort: settings.reasoningEffort || "high",
+    temperature: Number(settings.temperature ?? 0.1),
+    maxContextChars: Number(settings.maxContextChars ?? 60_000),
+    comprehensiveBatchChars: Number(settings.comprehensiveBatchChars ?? 8_000),
+    apiKey: options.apiKey || null,
+    clearApiKey: Boolean(options.clearApiKey),
+  };
+}
+
+function renderApiKeyStatus() {
+  if (!els.apiKeyStatus) return;
+  const settings = state.snapshot?.settings;
+  const saved = Boolean(settings?.apiKeySaved);
+  const storage = settings?.apiKeyStorage || "none";
+  if (!saved) {
+    els.apiKeyStatus.textContent = "APIキーは未設定です。";
+  } else if (storage === "os-keychain") {
+    els.apiKeyStatus.textContent = "APIキーは保存済みです。";
+  } else {
+    els.apiKeyStatus.textContent = "APIキーは保存済みです。";
+  }
+  els.clearApiKeyButton.disabled = state.busy || !saved;
+}
+
+function setSettingsSaving(saving) {
+  els.apiKeyInput.disabled = saving;
+  els.clearApiKeyButton.disabled = saving || !state.snapshot?.settings?.apiKeySaved;
+  els.saveSettingsButton.disabled = saving;
+  els.settingsCloseButton.disabled = saving;
 }
 
 function startNewChat() {
@@ -1055,6 +1202,7 @@ function setBusy(busy) {
   if (busy) state.openHistoryMenuId = null;
   els.sidebar.classList.toggle("is-locked", busy);
   els.historySidebar.classList.toggle("is-locked", busy);
+  els.settingsButton.disabled = busy;
   els.chooseSourceButton.disabled = busy;
   els.indexButton.disabled = busy;
   els.selectAllButton.disabled = busy;
