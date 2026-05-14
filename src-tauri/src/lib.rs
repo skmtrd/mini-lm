@@ -26,6 +26,7 @@ const EMBEDDING_MODEL: &str = "mini-lm-ja-ngram-hash-v1";
 const EMBEDDING_DIMS: usize = 384;
 const DEFAULT_CONTEXT_CHARS: usize = 12_000;
 const DEFAULT_BATCH_CHARS: usize = 6_000;
+const MAX_REDUCED_FACTS: usize = 120;
 const MAX_SHORT_RATE_WAIT_MS: u64 = 15_000;
 const ALLOWED_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "csv", "tsv", "json", "log", "text"];
 
@@ -253,7 +254,43 @@ struct ExtractedFact {
     char_start: i64,
     char_end: i64,
     statement: String,
+    scope: String,
+    subject: String,
+    object: String,
+    condition: String,
+    effect: String,
+    exception: String,
+    polarity: String,
     quote: String,
+    confidence: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct QuestionProfile {
+    terms: Vec<String>,
+    aspects: Vec<String>,
+    lower_concepts: Vec<String>,
+    is_broad: bool,
+}
+
+impl QuestionProfile {
+    fn from_question(question: &str) -> Self {
+        let terms = extract_terms(question);
+        Self {
+            is_broad: is_broad_question(question, &terms),
+            terms,
+            aspects: Vec::new(),
+            lower_concepts: Vec::new(),
+        }
+    }
+
+    fn search_terms(&self) -> Vec<String> {
+        let mut terms = self.terms.clone();
+        terms.extend(self.aspects.clone());
+        terms.extend(self.lower_concepts.clone());
+        normalize_string_list(&mut terms);
+        terms
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -739,32 +776,6 @@ async fn answer_question_inner(
         search
     };
 
-    if search.hits.is_empty() {
-        let answer = "根拠が見つかりません。選択中のsource内に、この質問へ回答できる該当箇所は見つかりませんでした。".to_string();
-        let conn = state.conn()?;
-        save_answer(&conn, run_id, &answer, None)?;
-        complete_run(&conn, run_id, "complete", None)?;
-        emit_progress(
-            app,
-            started,
-            "answer",
-            "complete",
-            "根拠なしとして完了しました",
-            Some(run_id.to_string()),
-            1,
-            1,
-            false,
-        );
-        return Ok(AnswerResponse {
-            run_id: run_id.to_string(),
-            status: "complete".to_string(),
-            answer,
-            hits: vec![],
-            facts: vec![],
-            audit: None,
-        });
-    }
-
     let is_comprehensive = true;
     if is_comprehensive {
         answer_comprehensively(app, state, &settings, request, run_id, cancel, started, search.hits).await
@@ -857,13 +868,14 @@ async fn answer_comprehensively(
         true,
     );
 
-    let profile_terms = build_question_profile(app, settings, &request.question, run_id, cancel)
+    let mut profile = build_question_profile(app, settings, &request.question, run_id, cancel)
         .await
-        .unwrap_or_else(|_| extract_terms(&request.question));
+        .unwrap_or_else(|_| QuestionProfile::from_question(&request.question));
     let chunks = {
         let conn = state.conn()?;
         load_selected_chunks(&conn, &request.selected_document_ids)?
     };
+    enrich_profile_with_source_concepts(&mut profile, &chunks, &request.question);
     let batches = build_chunk_batches(&chunks, settings.comprehensive_batch_chars);
     let total_batches = batches.len() as u64;
     let mut facts = Vec::new();
@@ -902,7 +914,7 @@ async fn answer_comprehensively(
             app,
             settings,
             &request.question,
-            &profile_terms,
+            &profile,
             batch,
             run_id,
             cancel,
@@ -928,9 +940,36 @@ async fn answer_comprehensively(
         true,
     );
 
-    let reduced_facts = reduce_facts(app, settings, &request.question, &facts, run_id, cancel).await?;
-    let answer = synthesize_answer(app, settings, &request.question, &reduced_facts, run_id, cancel).await?;
-    let audit = audit_facts_answer(app, settings, &answer, &reduced_facts, run_id, cancel).await.ok();
+    let reduced_facts = reduce_facts(app, settings, &request.question, &profile, &facts, run_id, cancel).await?;
+    let mut answer = synthesize_answer(app, settings, &request.question, &profile, &reduced_facts, run_id, cancel).await?;
+    let mut audit = audit_facts_answer(app, settings, &request.question, &answer, &reduced_facts, run_id, cancel).await.ok();
+
+    if let Some(audit_text) = audit.clone() {
+        if audit_needs_revision(&audit_text) {
+            emit_progress(
+                app,
+                started,
+                "audit",
+                "running",
+                "監査結果に基づいて回答を修正しています",
+                Some(run_id.to_string()),
+                total_batches,
+                total_batches,
+                true,
+            );
+            if let Ok(revised) =
+                revise_answer_from_audit(app, settings, &request.question, &answer, &audit_text, &reduced_facts, run_id, cancel)
+                    .await
+            {
+                answer = revised;
+                let revised_audit =
+                    audit_facts_answer(app, settings, &request.question, &answer, &reduced_facts, run_id, cancel)
+                        .await
+                        .ok();
+                audit = Some(combine_audit_json(&audit_text, revised_audit.as_deref()));
+            }
+        }
+    }
 
     let conn = state.conn()?;
     save_answer(&conn, run_id, &answer, audit.as_deref())?;
@@ -1741,46 +1780,223 @@ fn build_chunk_batches(chunks: &[ChunkRecord], max_chars: usize) -> Vec<Vec<Chun
     batches
 }
 
+fn enrich_profile_with_source_concepts(profile: &mut QuestionProfile, chunks: &[ChunkRecord], question: &str) {
+    let mut concepts = source_derived_concepts(chunks, question, &profile.terms);
+    profile.lower_concepts.append(&mut concepts);
+    normalize_string_list(&mut profile.lower_concepts);
+    if !profile.lower_concepts.is_empty() && is_broad_question(question, &profile.terms) {
+        profile.is_broad = true;
+    }
+}
+
+fn source_derived_concepts(chunks: &[ChunkRecord], question: &str, terms: &[String]) -> Vec<String> {
+    let question_terms = meaningful_question_terms(question, terms);
+    let mut scores: HashMap<String, f64> = HashMap::new();
+
+    for chunk in chunks {
+        for concept in concepts_from_heading(&chunk.heading_path) {
+            if is_generic_concept(&concept) {
+                continue;
+            }
+            let mut score = 1.0;
+            if concept_matches_question(&concept, &question_terms) {
+                score += 8.0;
+            }
+            if chunk.content.contains(&concept) {
+                score += 0.5;
+            }
+            *scores.entry(concept).or_insert(0.0) += score;
+        }
+    }
+
+    let broad = is_broad_question(question, terms);
+    let mut ranked = scores
+        .into_iter()
+        .filter(|(concept, score)| broad || *score >= 8.0 || concept_matches_question(concept, &question_terms))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+    let mut out = ranked
+        .into_iter()
+        .map(|(concept, _)| concept)
+        .take(if broad { 80 } else { 30 })
+        .collect::<Vec<_>>();
+    normalize_string_list(&mut out);
+    out
+}
+
+fn concepts_from_heading(heading_path: &str) -> Vec<String> {
+    let mut concepts = Vec::new();
+    for raw in heading_path.split(" > ") {
+        let concept = normalize_heading_concept(raw);
+        if concept.chars().count() >= 2 && concept.chars().count() <= 50 {
+            concepts.push(concept);
+        }
+    }
+    normalize_string_list(&mut concepts);
+    concepts
+}
+
+fn normalize_heading_concept(raw: &str) -> String {
+    let mut text = raw.trim().to_string();
+    if text.starts_with('（') && text.ends_with('）') && text.chars().count() <= 60 {
+        text = text
+            .trim_start_matches('（')
+            .trim_end_matches('）')
+            .trim()
+            .to_string();
+    }
+    let article_re = Regex::new(r"^第[0-9０-９一二三四五六七八九十百千]+(章|節|款|目|条)\s*").unwrap();
+    text = article_re.replace(&text, "").trim().to_string();
+    text.trim_matches(|c: char| matches!(c, '「' | '」' | '"' | '\'' | ' ' | '\t'))
+        .to_string()
+}
+
+fn meaningful_question_terms(question: &str, terms: &[String]) -> Vec<String> {
+    let mut out = terms.to_vec();
+    out.extend(extract_terms(question));
+    out.retain(|term| term.chars().count() >= 2 && !is_stop_term(term));
+    normalize_string_list(&mut out);
+    out
+}
+
+fn concept_matches_question(concept: &str, terms: &[String]) -> bool {
+    terms.iter().any(|term| {
+        term.chars().count() >= 2 && (concept.contains(term) || term.contains(concept))
+    })
+}
+
+fn is_broad_question(question: &str, terms: &[String]) -> bool {
+    let q = question.trim();
+    if q.chars().count() <= 12 && terms.len() <= 8 {
+        return true;
+    }
+    [
+        "どうなっていますか",
+        "どうなってますか",
+        "全体",
+        "一覧",
+        "まとめ",
+        "網羅",
+        "すべて",
+        "全部",
+        "全て",
+        "教えて",
+        "について",
+    ]
+    .iter()
+    .any(|marker| q.contains(marker))
+}
+
+fn is_stop_term(term: &str) -> bool {
+    matches!(
+        term,
+        "どう"
+            | "なっ"
+            | "なって"
+            | "います"
+            | "ます"
+            | "です"
+            | "ください"
+            | "教えて"
+            | "について"
+            | "もの"
+            | "こと"
+            | "場合"
+            | "情報"
+            | "質問"
+            | "回答"
+            | "一覧"
+            | "まとめ"
+            | "全体"
+            | "全部"
+            | "全て"
+            | "すべて"
+    )
+}
+
+fn is_generic_concept(concept: &str) -> bool {
+    matches!(
+        concept,
+        "総則"
+            | "目的"
+            | "定義"
+            | "適用範囲"
+            | "雑則"
+            | "附則"
+            | "施行"
+            | "改正"
+            | "経過措置"
+    )
+}
+
+fn normalize_string_list(items: &mut Vec<String>) {
+    for item in items.iter_mut() {
+        *item = item.trim().to_string();
+    }
+    items.retain(|item| item.chars().count() >= 2 && item.chars().count() <= 80);
+    items.sort();
+    items.dedup();
+}
+
 async fn build_question_profile(
     app: &AppHandle,
     settings: &Settings,
     question: &str,
     run_id: &str,
     cancel: &Arc<AtomicBool>,
-) -> Result<Vec<String>, String> {
+) -> Result<QuestionProfile, String> {
     let messages = vec![
         json!({
             "role": "system",
-            "content": "質問から、ローカル文書検索に使う日本語検索語、同義語、表記揺れ、観点をJSONだけで返してください。質問が「どうなっていますか」「できますか」「対象ですか」のような形なら、直接回答に必要な判断条件もaspectsへ含めてください。形式: {\"terms\":[\"...\"],\"aspects\":[\"...\"]}"
+            "content": "質問から、ローカル文書検索に使う日本語検索語、同義語、表記揺れ、回答観点をJSONだけで返してください。source外の事実を作らないでください。質問が「どうなっていますか」「一覧」「全体」「まとめ」のように広い場合は is_broad を true にしてください。形式: {\"terms\":[\"...\"],\"aspects\":[\"...\"],\"is_broad\":true|false}"
         }),
         json!({"role": "user", "content": question}),
     ];
     let content = call_deepseek(app, settings, messages, 800, true, false, Some(run_id), cancel).await?;
     let mut terms = extract_terms(question);
+    let mut aspects = Vec::new();
+    let mut is_broad = is_broad_question(question, &terms);
     if let Ok(parsed) = serde_json::from_str::<JsonValue>(&content) {
-        for key in ["terms", "aspects"] {
-            if let Some(items) = parsed.get(key).and_then(|v| v.as_array()) {
-                for item in items {
-                    if let Some(text) = item.as_str() {
-                        terms.extend(extract_terms(text));
-                        if text.chars().count() >= 2 && text.chars().count() <= 40 {
-                            terms.push(text.to_string());
-                        }
+        if let Some(items) = parsed.get("terms").and_then(|v| v.as_array()) {
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    terms.extend(extract_terms(text));
+                    if text.chars().count() >= 2 && text.chars().count() <= 40 {
+                        terms.push(text.to_string());
                     }
                 }
             }
         }
+        if let Some(items) = parsed.get("aspects").and_then(|v| v.as_array()) {
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    aspects.extend(extract_terms(text));
+                    if text.chars().count() >= 2 && text.chars().count() <= 50 {
+                        aspects.push(text.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(value) = parsed.get("is_broad").and_then(|v| v.as_bool()) {
+            is_broad |= value;
+        }
     }
-    terms.sort();
-    terms.dedup();
-    Ok(terms)
+    normalize_string_list(&mut terms);
+    normalize_string_list(&mut aspects);
+    Ok(QuestionProfile {
+        terms,
+        aspects,
+        lower_concepts: Vec::new(),
+        is_broad,
+    })
 }
 
 async fn extract_facts_from_batch(
     app: &AppHandle,
     settings: &Settings,
     question: &str,
-    profile_terms: &[String],
+    profile: &QuestionProfile,
     batch: &[ChunkRecord],
     run_id: &str,
     cancel: &Arc<AtomicBool>,
@@ -1792,14 +2008,27 @@ async fn extract_facts_from_batch(
             chunk.id, chunk.file_name, chunk.char_start, chunk.char_end, chunk.heading_path, chunk.content
         ));
     }
+    let profile_terms = profile.search_terms();
+    let lower_concepts = if profile.lower_concepts.is_empty() {
+        "なし".to_string()
+    } else {
+        profile.lower_concepts.iter().take(80).cloned().collect::<Vec<_>>().join(", ")
+    };
     let messages = vec![
         json!({
             "role": "system",
-            "content": "あなたは文書監査用の抽出器です。質問へ直接答えるために必要な事実だけをSOURCEから抽出してください。条件、例外、対象、手続き、金額、期間、判断基準を優先してください。SOURCEにない推測は禁止です。JSONだけで返してください。形式: {\"facts\":[{\"chunk_id\":123,\"statement\":\"...\",\"quote\":\"SOURCE中の短い根拠引用\"}]}"
+            "content": "あなたは文書監査用の抽出器です。質問へ直接答えるために必要な事実だけをSOURCEから抽出してください。SOURCEにない推測は禁止です。特に scope, subject, object, condition, effect の関係を崩さず抽出してください。条件、例外、対象、手続き、金額、期間、判断基準を優先してください。広い質問の場合は、提示されたsource由来の下位概念に関する事実も漏らさず抽出してください。JSONだけで返してください。形式: {\"facts\":[{\"chunk_id\":123,\"statement\":\"...\",\"scope\":\"文書名/章/条/制度など\",\"subject\":\"誰・何についてか\",\"object\":\"対象制度・手当・行為など\",\"condition\":\"成立条件・対象条件・除外条件\",\"effect\":\"支給/控除/必要/禁止などの効果\",\"exception\":\"例外。なければ空文字\",\"polarity\":\"positive|negative|conditional\",\"quote\":\"SOURCE中の短い根拠引用\",\"confidence\":\"high|medium|low\"}]}"
         }),
         json!({
             "role": "user",
-            "content": format!("質問:\n{}\n\n検索観点:\n{}\n\nSOURCE:\n{}", question, profile_terms.join(", "), source)
+            "content": format!(
+                "質問:\n{}\n\n広い質問か:\n{}\n\n検索観点:\n{}\n\nsource由来の下位概念候補:\n{}\n\n抽出ルール:\n- source外の一般知識は使わない\n- condition がある effect は、必ず condition と結び付けて抽出する\n- subject/object/scope を広げない\n- 否定、対象外、ただし書きは polarity または exception に残す\n- 質問範囲外の不足情報は抽出しない\n\nSOURCE:\n{}",
+                question,
+                profile.is_broad,
+                profile_terms.join(", "),
+                lower_concepts,
+                source
+            )
         }),
     ];
     let content = call_deepseek(app, settings, messages, 1_400, true, false, Some(run_id), cancel).await?;
@@ -1820,6 +2049,19 @@ async fn extract_facts_from_batch(
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let scope = fact_field(item, "scope");
+            let subject = fact_field(item, "subject");
+            let object = fact_field(item, "object");
+            let condition = fact_field(item, "condition");
+            let effect = fact_field(item, "effect");
+            let exception = fact_field(item, "exception");
+            let polarity = normalize_polarity(&fact_field(item, "polarity"), &condition, &effect);
+            let confidence = normalize_confidence(&fact_field(item, "confidence"));
+            let statement = if statement.is_empty() {
+                compose_fact_statement(&subject, &object, &condition, &effect, &exception)
+            } else {
+                statement
+            };
             if statement.is_empty() {
                 continue;
             }
@@ -1832,7 +2074,19 @@ async fn extract_facts_from_batch(
                     char_start: chunk.char_start,
                     char_end: chunk.char_end,
                     statement,
+                    scope: if scope.is_empty() {
+                        fallback_scope(chunk)
+                    } else {
+                        scope
+                    },
+                    subject,
+                    object,
+                    condition,
+                    effect,
+                    exception,
+                    polarity,
                     quote,
+                    confidence,
                 });
             }
         }
@@ -1840,35 +2094,108 @@ async fn extract_facts_from_batch(
     Ok(out)
 }
 
+fn fact_field(item: &JsonValue, key: &str) -> String {
+    item.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn normalize_polarity(raw: &str, condition: &str, effect: &str) -> String {
+    let value = raw.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "positive" | "negative" | "conditional") {
+        return value;
+    }
+    if !condition.trim().is_empty() {
+        return "conditional".to_string();
+    }
+    if effect.contains("ない") || effect.contains("対象外") || effect.contains("除く") || effect.contains("禁止") {
+        return "negative".to_string();
+    }
+    "positive".to_string()
+}
+
+fn normalize_confidence(raw: &str) -> String {
+    let value = raw.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "high" | "medium" | "low") {
+        value
+    } else {
+        "medium".to_string()
+    }
+}
+
+fn compose_fact_statement(subject: &str, object: &str, condition: &str, effect: &str, exception: &str) -> String {
+    let mut parts = Vec::new();
+    if !subject.trim().is_empty() {
+        parts.push(format!("subject={}", subject.trim()));
+    }
+    if !object.trim().is_empty() {
+        parts.push(format!("object={}", object.trim()));
+    }
+    if !condition.trim().is_empty() {
+        parts.push(format!("condition={}", condition.trim()));
+    }
+    if !effect.trim().is_empty() {
+        parts.push(format!("effect={}", effect.trim()));
+    }
+    if !exception.trim().is_empty() {
+        parts.push(format!("exception={}", exception.trim()));
+    }
+    parts.join(" / ")
+}
+
+fn fallback_scope(chunk: &ChunkRecord) -> String {
+    if chunk.heading_path.trim().is_empty() {
+        chunk.file_name.clone()
+    } else {
+        format!("{} / {}", chunk.file_name, chunk.heading_path)
+    }
+}
+
 async fn reduce_facts(
     app: &AppHandle,
     settings: &Settings,
     question: &str,
+    profile: &QuestionProfile,
     facts: &[ExtractedFact],
     run_id: &str,
     cancel: &Arc<AtomicBool>,
 ) -> Result<Vec<ExtractedFact>, String> {
-    if facts.len() <= 80 {
+    if facts.len() <= MAX_REDUCED_FACTS {
         return Ok(facts.to_vec());
     }
     let mut source = String::new();
     for (idx, fact) in facts.iter().enumerate() {
         source.push_str(&format!(
-            "[F{}] chunk={} file={} heading={} statement={} quote={}\n",
+            "[F{}] chunk={} file={} heading={} scope={} subject={} object={} condition={} effect={} exception={} polarity={} confidence={} statement={} quote={}\n",
             idx + 1,
             fact.chunk_id,
             fact.file_name,
             fact.heading_path,
+            fact.scope,
+            fact.subject,
+            fact.object,
+            fact.condition,
+            fact.effect,
+            fact.exception,
+            fact.polarity,
+            fact.confidence,
             fact.statement,
             fact.quote
         ));
     }
+    let lower_concepts = if profile.lower_concepts.is_empty() {
+        "なし".to_string()
+    } else {
+        profile.lower_concepts.iter().take(80).cloned().collect::<Vec<_>>().join(", ")
+    };
     let messages = vec![
         json!({
             "role": "system",
-            "content": "重複した抽出事実を統合し、質問へ直接答えるために必要な事実を最大80件に整理してください。結論、条件、例外、対象、手続き、金額、期間、判断基準に関わる事実を優先してください。JSONだけで返してください。形式: {\"keep_indexes\":[1,2,3]}"
+            "content": "重複した抽出事実を統合し、質問へ直接答えるために必要な事実を残してください。source由来の下位概念がある場合は、質問に関係する各下位概念の根拠を可能な限り残してください。結論、条件、例外、対象、手続き、金額、期間、判断基準に関わる事実を優先してください。subject/object/condition/effect/scope の関係が違う事実を混ぜないでください。JSONだけで返してください。形式: {\"keep_indexes\":[1,2,3]}"
         }),
-        json!({"role":"user","content":format!("質問:\n{}\n\nFACTS:\n{}", question, source)}),
+        json!({"role":"user","content":format!("質問:\n{}\n\n広い質問か:\n{}\n\nsource由来の下位概念候補:\n{}\n\n残す最大件数:\n{}\n\nFACTS:\n{}", question, profile.is_broad, lower_concepts, MAX_REDUCED_FACTS, source)}),
     ];
     let content = call_deepseek(app, settings, messages, 1_200, true, false, Some(run_id), cancel).await?;
     let parsed = serde_json::from_str::<JsonValue>(&content).unwrap_or_else(|_| json!({}));
@@ -1883,8 +2210,9 @@ async fn reduce_facts(
         }
     }
     if reduced.is_empty() {
-        Ok(facts.iter().take(80).cloned().collect())
+        Ok(facts.iter().take(MAX_REDUCED_FACTS).cloned().collect())
     } else {
+        reduced.truncate(MAX_REDUCED_FACTS);
         Ok(reduced)
     }
 }
@@ -1893,6 +2221,7 @@ async fn synthesize_answer(
     app: &AppHandle,
     settings: &Settings,
     question: &str,
+    profile: &QuestionProfile,
     facts: &[ExtractedFact],
     run_id: &str,
     cancel: &Arc<AtomicBool>,
@@ -1902,18 +2231,13 @@ async fn synthesize_answer(
     }
     let mut source = String::new();
     for (idx, fact) in facts.iter().enumerate() {
-        source.push_str(&format!(
-            "[F{}] file={} chunk={} chars={}-{} heading={}\nstatement: {}\nquote: {}\n\n",
-            idx + 1,
-            fact.file_name,
-            fact.chunk_id,
-            fact.char_start,
-            fact.char_end,
-            fact.heading_path,
-            fact.statement,
-            fact.quote
-        ));
+        source.push_str(&format_fact_for_prompt(idx + 1, fact));
     }
+    let lower_concepts = if profile.lower_concepts.is_empty() {
+        "なし".to_string()
+    } else {
+        profile.lower_concepts.iter().take(80).cloned().collect::<Vec<_>>().join(", ")
+    };
     let messages = vec![
         json!({
             "role": "system",
@@ -1921,10 +2245,16 @@ async fn synthesize_answer(
         }),
         json!({
             "role": "user",
-            "content": format!("質問:\n{}\n\nFACTS:\n{}\n\n回答要件:\n- 冒頭で質問への直接回答を書く\n- 「はい/いいえ」「対象/対象外」「できる/できない」「こう扱う」など判断できる質問では、まず判断を示す\n- 判断に条件がある場合は、条件付きの結論として書く\n- その後に理由、条件、例外、対象者、金額、期間、手続きを整理する\n- 文書間差分や矛盾があれば明示する\n- FACTSにない推測は禁止\n- 根拠不足なら、どの点が不足かを明示する\n- 日本語で、Markdownとして読みやすく回答する", question, source)
+            "content": format!(
+                "質問:\n{}\n\n広い質問か:\n{}\n\nsource由来の下位概念候補:\n{}\n\nFACTS:\n{}\n\n回答要件:\n- 冒頭で質問への直接回答を書く\n- 「はい/いいえ」「対象/対象外」「できる/できない」「こう扱う」など判断できる質問では、まず判断を示す\n- 判断に条件がある場合は、条件付きの結論として書く\n- 広い質問では、source由来の下位概念候補とFACTSに基づいて、関係する下位概念ごとに整理する\n- その後に理由、条件、例外、対象者、金額、期間、手続きを整理する\n- 文書間差分や矛盾があれば明示する\n- FACTSにない推測は禁止\n- subject を別の主体に置き換えない\n- object を別の制度・手当・行為に置き換えない\n- condition のない effect として断定しない\n- effect を反転させない\n- scope を広げない\n- 根拠不足は、質問へ直接答えるために必要な点だけに絞る\n- 日本語で、Markdownとして読みやすく回答する",
+                question,
+                profile.is_broad,
+                lower_concepts,
+                source
+            )
         }),
     ];
-    call_deepseek(app, settings, messages, 2_500, false, true, Some(run_id), cancel).await
+    call_deepseek(app, settings, messages, 3_500, false, true, Some(run_id), cancel).await
 }
 
 async fn audit_answer(
@@ -1946,6 +2276,7 @@ async fn audit_answer(
 async fn audit_facts_answer(
     app: &AppHandle,
     settings: &Settings,
+    question: &str,
     answer: &str,
     facts: &[ExtractedFact],
     run_id: &str,
@@ -1953,13 +2284,104 @@ async fn audit_facts_answer(
 ) -> Result<String, String> {
     let mut source = String::new();
     for (idx, fact) in facts.iter().enumerate() {
-        source.push_str(&format!("[F{}] {}\nquote: {}\n", idx + 1, fact.statement, fact.quote));
+        source.push_str(&format_fact_for_prompt(idx + 1, fact));
     }
     let messages = vec![
-        json!({"role":"system","content":"回答の各主張がFACTSに支えられているか検査し、JSONだけで返してください。形式: {\"unsupported_claims\":[\"...\"],\"verdict\":\"pass|warning|fail\"}"}),
-        json!({"role":"user","content":format!("ANSWER:\n{}\n\nFACTS:\n{}", answer, source)}),
+        json!({"role":"system","content":"回答の各主張がFACTSに支えられているか検査し、JSONだけで返してください。unsupported_claims はFACTSにない主張、relationship_errors は subject/object/condition/effect の関係ミス、scope_errors はFACTSより広い範囲への一般化、polarity_errors は肯定/否定/条件付きの反転や言い過ぎ、insufficient_evidence_overreach は質問範囲外の根拠不足列挙です。形式: {\"unsupported_claims\":[\"...\"],\"relationship_errors\":[{\"claim\":\"...\",\"problem\":\"...\",\"supported_fact_ids\":[\"F1\"]}],\"scope_errors\":[{\"claim\":\"...\",\"problem\":\"...\",\"supported_fact_ids\":[\"F2\"]}],\"polarity_errors\":[{\"claim\":\"...\",\"problem\":\"...\",\"supported_fact_ids\":[\"F3\"]}],\"insufficient_evidence_overreach\":[\"...\"],\"verdict\":\"pass|warning|fail\"}"}),
+        json!({"role":"user","content":format!("QUESTION:\n{}\n\nANSWER:\n{}\n\nFACTS:\n{}", question, answer, source)}),
     ];
-    call_deepseek(app, settings, messages, 1_000, true, false, Some(run_id), cancel).await
+    call_deepseek(app, settings, messages, 1_500, true, false, Some(run_id), cancel).await
+}
+
+async fn revise_answer_from_audit(
+    app: &AppHandle,
+    settings: &Settings,
+    question: &str,
+    answer: &str,
+    audit: &str,
+    facts: &[ExtractedFact],
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let mut source = String::new();
+    for (idx, fact) in facts.iter().enumerate() {
+        source.push_str(&format_fact_for_prompt(idx + 1, fact));
+    }
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "あなたはローカル文書専用回答の修正者です。AUDITで指摘された unsupported/relationship/scope/polarity/overreach を修正してください。FACTSだけを根拠にし、根拠のない主張は削除するか根拠不足として質問範囲内に限定して書いてください。subject/object/condition/effect/scope を改変しないでください。Markdownで回答だけを返してください。"
+        }),
+        json!({
+            "role": "user",
+            "content": format!("QUESTION:\n{}\n\nCURRENT_ANSWER:\n{}\n\nAUDIT:\n{}\n\nFACTS:\n{}", question, answer, audit, source)
+        }),
+    ];
+    call_deepseek(app, settings, messages, 3_000, false, true, Some(run_id), cancel).await
+}
+
+fn format_fact_for_prompt(index: usize, fact: &ExtractedFact) -> String {
+    format!(
+        "[F{}] file={} chunk={} chars={}-{} heading={}\nscope: {}\nsubject: {}\nobject: {}\ncondition: {}\neffect: {}\nexception: {}\npolarity: {}\nconfidence: {}\nstatement: {}\nquote: {}\n\n",
+        index,
+        fact.file_name,
+        fact.chunk_id,
+        fact.char_start,
+        fact.char_end,
+        fact.heading_path,
+        fact.scope,
+        fact.subject,
+        fact.object,
+        fact.condition,
+        fact.effect,
+        fact.exception,
+        fact.polarity,
+        fact.confidence,
+        fact.statement,
+        fact.quote
+    )
+}
+
+fn audit_needs_revision(audit: &str) -> bool {
+    let parsed = match serde_json::from_str::<JsonValue>(audit) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let verdict = parsed
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if verdict == "warning" || verdict == "fail" {
+        return true;
+    }
+    [
+        "unsupported_claims",
+        "relationship_errors",
+        "scope_errors",
+        "polarity_errors",
+        "insufficient_evidence_overreach",
+    ]
+    .iter()
+    .any(|key| {
+        parsed
+            .get(key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|items| !items.is_empty())
+    })
+}
+
+fn combine_audit_json(initial: &str, final_audit: Option<&str>) -> String {
+    let initial_value = serde_json::from_str::<JsonValue>(initial).unwrap_or_else(|_| json!({"raw": initial}));
+    let final_value = final_audit
+        .map(|text| serde_json::from_str::<JsonValue>(text).unwrap_or_else(|_| json!({"raw": text})))
+        .unwrap_or_else(|| json!({"error": "re-audit failed"}));
+    json!({
+        "revision_applied": true,
+        "initial": initial_value,
+        "final": final_value
+    })
+    .to_string()
 }
 
 async fn call_deepseek(
@@ -2243,9 +2665,10 @@ fn complete_run(conn: &Connection, run_id: &str, status: &str, error: Option<&st
 }
 
 fn insert_fact(conn: &Connection, run_id: &str, fact: &ExtractedFact) -> Result<(), String> {
+    let fact_json = serde_json::to_string(fact).unwrap_or_else(|_| fact.statement.clone());
     conn.execute(
         "INSERT INTO extracted_facts(run_id, chunk_id, fact, quote, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![run_id, fact.chunk_id, fact.statement, fact.quote, Utc::now().to_rfc3339()],
+        params![run_id, fact.chunk_id, fact_json, fact.quote, Utc::now().to_rfc3339()],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
