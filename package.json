@@ -8,7 +8,9 @@
     "build": "vite build",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build",
+    "tauri:build": "tauri build --bundles app",
+    "tauri:build:all": "tauri build",
+    "tauri:build:windows": "tauri build --bundles nsis,msi",
     "check": "npm run build && cargo check --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {

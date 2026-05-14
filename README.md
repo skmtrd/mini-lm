@@ -27,7 +27,17 @@ npm run tauri:dev
 npm run tauri:build
 ```
 
-macOSでは `.app` / `.dmg`、Windowsでは `.exe` / `.msi` をTauriのbundle設定に従って作成します。
+macOSでは `.app` を作成します。WindowsではWindows環境で次を実行します。
+
+```bash
+npm run tauri:build:windows
+```
+
+全bundleを試す場合は次を使います。
+
+```bash
+npm run tauri:build:all
+```
 
 ## チェック
 
