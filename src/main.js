@@ -165,7 +165,7 @@ function wireEvents() {
   });
   els.cancelButton.addEventListener("click", async () => {
     await invoke("cancel_current_task");
-    renderAssistantStatus("停止しています", "現在の処理へキャンセル要求を送りました。");
+    renderAssistantStatus("停止しています");
   });
   els.archiveButton.addEventListener("click", () => {
     archiveCurrentConversation();
@@ -303,7 +303,7 @@ async function answerQuestion() {
   state.lastProgressStage = "profile";
 
   try {
-    renderAssistantStatus("調べています", "資料全体を確認し、回答に必要な根拠を抽出しています。");
+    renderAssistantStatus("調べています");
     const response = await invoke("answer_question", {
       request: {
         question,
@@ -488,31 +488,8 @@ function renderProgress(payload) {
   if (payload.stage && payload.stage !== "api") {
     state.lastProgressStage = payload.stage;
   }
-  const detail = progressDetail(payload);
   const title = progressTitle(payload);
-  renderAssistantStatus(title, detail, payload);
-}
-
-function progressDetail(payload) {
-  const { stage, message = "", elapsedMs = 0 } = payload;
-  if (stage === "api") {
-    if (message.includes("制限") || message.includes("停止")) return message;
-    return apiStageDetail(state.lastProgressStage);
-  }
-  const elapsed = elapsedMs ? `${Math.round(elapsedMs / 1000)}秒` : "";
-  return [message, elapsed].filter(Boolean).join(" ・ ");
-}
-
-function apiStageDetail(stage) {
-  const details = {
-    profile: "検索語と確認観点を作っています。",
-    retrieve: "検索の準備を進めています。",
-    extract: "選択資料から根拠を抽出しています。",
-    synthesize: "抽出した根拠を統合しています。",
-    audit: "主張と根拠の対応を確認しています。",
-    answer: "回答文を受信しています。",
-  };
-  return details[stage] || "処理を進めています。";
+  renderAssistantStatus(title, payload);
 }
 
 function progressTitle(payload) {
@@ -557,7 +534,7 @@ function apiStageTitle(stage) {
   return labels[stage] || "処理しています";
 }
 
-function renderAssistantStatus(title, detail, payload = {}) {
+function renderAssistantStatus(title, payload = {}) {
   if (!state.currentAssistantBody) return;
   const shouldStick = shouldAutoScroll();
   const percent = payload.total ? Math.min(100, Math.round((payload.completed / payload.total) * 100)) : 0;
@@ -567,7 +544,6 @@ function renderAssistantStatus(title, detail, payload = {}) {
       <span class="thinking-dot"></span>
       <div>
         <strong>${escapeHtml(title)}</strong>
-        <p>${escapeHtml(detail || "")}</p>
         ${
           payload.total
             ? `<div class="progress-track" aria-hidden="true"><span style="width: ${percent}%"></span></div>`
@@ -586,10 +562,8 @@ function showToast(title, detail = "", tone = "info", options = {}) {
   toast.dataset.toastId = id;
   if (options.persist) toast.dataset.persist = "true";
   toast.innerHTML = `
-    <div class="toast-mark" aria-hidden="true"></div>
     <div class="toast-copy">
       <strong>${escapeHtml(title)}</strong>
-      ${detail ? `<p>${escapeHtml(detail)}</p>` : ""}
     </div>
     <button class="toast-close" type="button" aria-label="閉じる" title="閉じる">×</button>
   `;
