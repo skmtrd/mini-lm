@@ -361,6 +361,10 @@ button.primary {
   box-shadow: 0 8px 20px rgb(31 37 43 / 13%);
 }
 
+.jump-latest[hidden] {
+  display: none;
+}
+
 .message {
   max-width: min(1120px, 100%);
   margin-bottom: 14px;
