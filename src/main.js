@@ -597,7 +597,7 @@ function showToast(title, detail = "", tone = "info", options = {}) {
   els.toastRegion.append(toast);
   requestAnimationFrame(() => toast.classList.add("visible"));
   if (!options.persist) {
-    window.setTimeout(() => dismissToast(toast), options.duration ?? 4200);
+    window.setTimeout(() => dismissToast(toast), options.duration ?? 2000);
   }
   return id;
 }
