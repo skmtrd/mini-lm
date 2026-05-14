@@ -131,11 +131,6 @@ document.querySelector("#app").innerHTML = `
       <form id="settingsForm" class="settings-dialog" aria-labelledby="settingsTitle">
         <div class="settings-dialog-head">
           <h2 id="settingsTitle">設定</h2>
-          <button id="settingsCloseButton" class="modal-close-button" type="button" title="閉じる" aria-label="閉じる">×</button>
-        </div>
-        <div id="apiKeyState" class="settings-state">
-          <strong id="apiKeyStateTitle">未設定</strong>
-          <span id="apiKeyStateText">DeepSeek APIキーを保存してください。</span>
         </div>
         <label class="settings-field">
           <span>DeepSeek APIキー</span>
@@ -147,16 +142,20 @@ document.querySelector("#app").innerHTML = `
                 <circle cx="12" cy="12" r="3"></circle>
               </svg>
             </button>
+            <button id="clearApiKeyButton" class="api-key-delete-button" type="button" title="削除" aria-label="APIキーを削除">
+              <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M3 6h18"></path>
+                <path d="M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6"></path>
+                <path d="M19 6l-.8 13.1A2 2 0 0 1 16.2 21H7.8a2 2 0 0 1-2-1.9L5 6"></path>
+                <path d="M10 11v6"></path>
+                <path d="M14 11v6"></path>
+              </svg>
+            </button>
           </div>
         </label>
-        <p class="settings-note">保存済みのキー全文は再表示しません。新しいキーを入力して保存すると差し替えます。</p>
         <p id="apiKeyStatus" class="settings-status" role="status" aria-live="polite"></p>
         <div class="settings-dialog-actions">
-          <button id="clearApiKeyButton" class="text-button danger-text" type="button">削除</button>
-          <div class="settings-action-group">
-            <button id="settingsCancelButton" type="button">閉じる</button>
-            <button id="saveSettingsButton" class="primary" type="submit">保存</button>
-          </div>
+          <button id="saveSettingsButton" class="primary" type="submit">保存</button>
         </div>
       </form>
     </div>
@@ -187,11 +186,6 @@ const els = {
   historyList: $("#historyList"),
   settingsOverlay: $("#settingsOverlay"),
   settingsForm: $("#settingsForm"),
-  settingsCloseButton: $("#settingsCloseButton"),
-  settingsCancelButton: $("#settingsCancelButton"),
-  apiKeyState: $("#apiKeyState"),
-  apiKeyStateTitle: $("#apiKeyStateTitle"),
-  apiKeyStateText: $("#apiKeyStateText"),
   apiKeyInput: $("#apiKeyInput"),
   apiKeyVisibilityButton: $("#apiKeyVisibilityButton"),
   apiKeyStatus: $("#apiKeyStatus"),
@@ -220,8 +214,6 @@ async function init() {
 
 function wireEvents() {
   els.settingsButton.addEventListener("click", openSettingsDialog);
-  els.settingsCloseButton.addEventListener("click", closeSettingsDialog);
-  els.settingsCancelButton.addEventListener("click", closeSettingsDialog);
   els.settingsOverlay.addEventListener("click", (event) => {
     if (event.target === els.settingsOverlay) closeSettingsDialog();
   });
@@ -583,17 +575,10 @@ function updateSettingsDialogState() {
   const saved = Boolean(settings?.apiKeySaved);
   const hasInput = els.apiKeyInput.value.trim().length > 0;
   const saving = state.settingsSaving;
-  els.apiKeyState.dataset.state = saved ? "saved" : "missing";
-  els.apiKeyStateTitle.textContent = saved ? "保存済み" : "未設定";
-  els.apiKeyStateText.textContent = saved
-    ? `現在のキー: ${settings.apiKeyHint || "保存済み"}`
-    : "DeepSeek APIキーを保存してください。";
   els.apiKeyInput.placeholder = saved ? "新しいキーを入力すると差し替え" : "sk-...";
   els.clearApiKeyButton.disabled = saving || state.busy || !saved;
   els.saveSettingsButton.disabled = saving || state.busy || !hasInput;
-  els.saveSettingsButton.textContent = saving ? "保存中..." : saved ? "差し替え保存" : "保存";
-  els.settingsCloseButton.disabled = saving;
-  els.settingsCancelButton.disabled = saving;
+  els.saveSettingsButton.textContent = saving ? "保存中..." : "保存";
   els.apiKeyVisibilityButton.disabled = saving;
   els.apiKeyInput.disabled = saving;
 }
