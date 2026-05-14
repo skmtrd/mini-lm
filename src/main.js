@@ -767,8 +767,13 @@ function shouldAutoScroll() {
 }
 
 function isNearBottom() {
+  if (!canScrollMessages()) return true;
   const distance = els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight;
   return distance < 96;
+}
+
+function canScrollMessages() {
+  return els.messages.scrollHeight > els.messages.clientHeight + 2;
 }
 
 function scrollMessages(options = {}) {
@@ -780,7 +785,7 @@ function scrollMessages(options = {}) {
 }
 
 function renderJumpButton() {
-  const show = !state.autoScroll && !isNearBottom();
+  const show = canScrollMessages() && !isNearBottom();
   els.jumpToLatestButton.hidden = !show;
 }
 
