@@ -3185,4 +3185,62 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "max");
         assert_eq!(body["response_format"]["type"], "json_object");
     }
+
+    #[test]
+    fn broad_question_discovers_source_derived_lower_concepts() {
+        let chunks = vec![
+            ChunkRecord {
+                id: 1,
+                document_id: 1,
+                file_name: "rules.txt".to_string(),
+                path: "/tmp/rules.txt".to_string(),
+                heading_path: "第1章 給与 > 第1条 扶養手当".to_string(),
+                char_start: 0,
+                char_end: 10,
+                content: "扶養手当は、扶養親族を有する職員に支給する。".to_string(),
+                prev_chunk_id: None,
+                next_chunk_id: Some(2),
+            },
+            ChunkRecord {
+                id: 2,
+                document_id: 1,
+                file_name: "rules.txt".to_string(),
+                path: "/tmp/rules.txt".to_string(),
+                heading_path: "第1章 給与 > 第2条 通勤手当".to_string(),
+                char_start: 11,
+                char_end: 20,
+                content: "通勤手当は、通勤距離に応じて支給する。".to_string(),
+                prev_chunk_id: Some(1),
+                next_chunk_id: None,
+            },
+        ];
+        let mut profile = QuestionProfile::from_question("手当はどうなっていますか");
+        enrich_profile_with_source_concepts(&mut profile, &chunks, "手当はどうなっていますか");
+
+        assert!(profile.is_broad);
+        assert!(profile.lower_concepts.contains(&"扶養手当".to_string()));
+        assert!(profile.lower_concepts.contains(&"通勤手当".to_string()));
+    }
+
+    #[test]
+    fn audit_revision_detector_checks_relationship_scope_and_polarity_errors() {
+        assert!(audit_needs_revision(
+            r#"{"verdict":"pass","unsupported_claims":[],"relationship_errors":[{"claim":"x"}],"scope_errors":[],"polarity_errors":[],"insufficient_evidence_overreach":[]}"#
+        ));
+        assert!(audit_needs_revision(
+            r#"{"verdict":"warning","unsupported_claims":[],"relationship_errors":[],"scope_errors":[],"polarity_errors":[],"insufficient_evidence_overreach":[]}"#
+        ));
+        assert!(!audit_needs_revision(
+            r#"{"verdict":"pass","unsupported_claims":[],"relationship_errors":[],"scope_errors":[],"polarity_errors":[],"insufficient_evidence_overreach":[]}"#
+        ));
+    }
+
+    #[test]
+    fn fact_statement_can_be_rebuilt_from_structured_fields() {
+        let statement = compose_fact_statement("職員", "扶養手当", "扶養親族を有する場合", "支給する", "");
+        assert!(statement.contains("subject=職員"));
+        assert!(statement.contains("object=扶養手当"));
+        assert!(statement.contains("condition=扶養親族を有する場合"));
+        assert!(statement.contains("effect=支給する"));
+    }
 }
