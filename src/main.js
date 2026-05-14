@@ -32,6 +32,7 @@ const state = {
   currentAssistantMessageId: null,
   typewriterTimer: null,
   typewriterResolvers: [],
+  settingsSaving: false,
   toastSeq: 0,
   autoScroll: true,
   lastProgressStage: "profile",
@@ -132,14 +133,30 @@ document.querySelector("#app").innerHTML = `
           <h2 id="settingsTitle">設定</h2>
           <button id="settingsCloseButton" class="modal-close-button" type="button" title="閉じる" aria-label="閉じる">×</button>
         </div>
+        <div id="apiKeyState" class="settings-state">
+          <strong id="apiKeyStateTitle">未設定</strong>
+          <span id="apiKeyStateText">DeepSeek APIキーを保存してください。</span>
+        </div>
         <label class="settings-field">
           <span>DeepSeek APIキー</span>
-          <input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false" placeholder="sk-..." />
+          <div class="api-key-input-row">
+            <input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false" placeholder="sk-..." />
+            <button id="apiKeyVisibilityButton" class="api-key-visibility-button" type="button" title="表示" aria-label="APIキーを表示">
+              <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"></path>
+                <circle cx="12" cy="12" r="3"></circle>
+              </svg>
+            </button>
+          </div>
         </label>
-        <p id="apiKeyStatus" class="settings-status"></p>
+        <p class="settings-note">保存済みのキー全文は再表示しません。新しいキーを入力して保存すると差し替えます。</p>
+        <p id="apiKeyStatus" class="settings-status" role="status" aria-live="polite"></p>
         <div class="settings-dialog-actions">
           <button id="clearApiKeyButton" class="text-button danger-text" type="button">削除</button>
-          <button id="saveSettingsButton" class="primary" type="submit">保存</button>
+          <div class="settings-action-group">
+            <button id="settingsCancelButton" type="button">閉じる</button>
+            <button id="saveSettingsButton" class="primary" type="submit">保存</button>
+          </div>
         </div>
       </form>
     </div>
@@ -171,7 +188,12 @@ const els = {
   settingsOverlay: $("#settingsOverlay"),
   settingsForm: $("#settingsForm"),
   settingsCloseButton: $("#settingsCloseButton"),
+  settingsCancelButton: $("#settingsCancelButton"),
+  apiKeyState: $("#apiKeyState"),
+  apiKeyStateTitle: $("#apiKeyStateTitle"),
+  apiKeyStateText: $("#apiKeyStateText"),
   apiKeyInput: $("#apiKeyInput"),
+  apiKeyVisibilityButton: $("#apiKeyVisibilityButton"),
   apiKeyStatus: $("#apiKeyStatus"),
   clearApiKeyButton: $("#clearApiKeyButton"),
   saveSettingsButton: $("#saveSettingsButton"),
@@ -199,11 +221,14 @@ async function init() {
 function wireEvents() {
   els.settingsButton.addEventListener("click", openSettingsDialog);
   els.settingsCloseButton.addEventListener("click", closeSettingsDialog);
+  els.settingsCancelButton.addEventListener("click", closeSettingsDialog);
   els.settingsOverlay.addEventListener("click", (event) => {
     if (event.target === els.settingsOverlay) closeSettingsDialog();
   });
   els.settingsForm.addEventListener("submit", saveApiKey);
   els.clearApiKeyButton.addEventListener("click", clearApiKey);
+  els.apiKeyInput.addEventListener("input", () => updateSettingsDialogState());
+  els.apiKeyVisibilityButton.addEventListener("click", toggleApiKeyVisibility);
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !els.settingsOverlay.hidden) closeSettingsDialog();
   });
@@ -456,41 +481,50 @@ function selectedDocumentIds() {
 
 function openSettingsDialog() {
   if (state.busy) return;
-  renderApiKeyStatus();
-  els.apiKeyInput.value = "";
+  resetSettingsForm();
+  updateSettingsDialogState();
   els.settingsOverlay.hidden = false;
   window.setTimeout(() => els.apiKeyInput.focus(), 0);
 }
 
 function closeSettingsDialog() {
+  if (state.settingsSaving) return;
   els.settingsOverlay.hidden = true;
-  els.apiKeyInput.value = "";
+  resetSettingsForm();
 }
 
 async function saveApiKey(event) {
   event.preventDefault();
   const apiKey = els.apiKeyInput.value.trim();
   if (!apiKey) {
-    showToast("APIキーを入力してください", "", "info");
+    setApiKeyStatus("APIキーを入力してください。", "warn");
+    updateSettingsDialogState();
     return;
   }
 
   setSettingsSaving(true);
+  setApiKeyStatus("保存しています...", "neutral");
   try {
     const settings = await invoke("save_settings", {
       update: buildSettingsUpdate({ apiKey }),
     });
+    if (!settings.apiKeySaved) {
+      throw new Error("保存後の確認に失敗しました。もう一度保存してください。");
+    }
     state.snapshot = {
       ...state.snapshot,
       settings,
     };
-    renderApiKeyStatus();
-    closeSettingsDialog();
+    els.apiKeyInput.value = "";
+    setApiKeyVisibility(false);
+    setApiKeyStatus(`保存しました: ${settings.apiKeyHint || "保存済み"}`, "success");
     showToast("APIキーを保存しました", "", "success");
   } catch (error) {
+    setApiKeyStatus(`保存に失敗しました: ${String(error)}`, "error");
     showToast("APIキーの保存に失敗しました", String(error), "error");
   } finally {
     setSettingsSaving(false);
+    updateSettingsDialogState();
   }
 }
 
@@ -498,6 +532,7 @@ async function clearApiKey() {
   if (state.busy || !state.snapshot?.settings?.apiKeySaved) return;
 
   setSettingsSaving(true);
+  setApiKeyStatus("削除しています...", "neutral");
   try {
     const settings = await invoke("save_settings", {
       update: buildSettingsUpdate({ clearApiKey: true }),
@@ -507,12 +542,15 @@ async function clearApiKey() {
       settings,
     };
     els.apiKeyInput.value = "";
-    renderApiKeyStatus();
+    setApiKeyVisibility(false);
+    setApiKeyStatus("APIキーを削除しました。", "success");
     showToast("APIキーを削除しました", "", "success");
   } catch (error) {
+    setApiKeyStatus(`削除に失敗しました: ${String(error)}`, "error");
     showToast("APIキーの削除に失敗しました", String(error), "error");
   } finally {
     setSettingsSaving(false);
+    updateSettingsDialogState();
   }
 }
 
@@ -531,25 +569,54 @@ function buildSettingsUpdate(options = {}) {
 }
 
 function renderApiKeyStatus() {
-  if (!els.apiKeyStatus) return;
+  updateSettingsDialogState();
+}
+
+function resetSettingsForm() {
+  els.apiKeyInput.value = "";
+  setApiKeyVisibility(false);
+  setApiKeyStatus("", "neutral");
+}
+
+function updateSettingsDialogState() {
   const settings = state.snapshot?.settings;
   const saved = Boolean(settings?.apiKeySaved);
-  const storage = settings?.apiKeyStorage || "none";
-  if (!saved) {
-    els.apiKeyStatus.textContent = "APIキーは未設定です。";
-  } else if (storage === "os-keychain") {
-    els.apiKeyStatus.textContent = "APIキーは保存済みです。";
-  } else {
-    els.apiKeyStatus.textContent = "APIキーは保存済みです。";
-  }
-  els.clearApiKeyButton.disabled = state.busy || !saved;
+  const hasInput = els.apiKeyInput.value.trim().length > 0;
+  const saving = state.settingsSaving;
+  els.apiKeyState.dataset.state = saved ? "saved" : "missing";
+  els.apiKeyStateTitle.textContent = saved ? "保存済み" : "未設定";
+  els.apiKeyStateText.textContent = saved
+    ? `現在のキー: ${settings.apiKeyHint || "保存済み"}`
+    : "DeepSeek APIキーを保存してください。";
+  els.apiKeyInput.placeholder = saved ? "新しいキーを入力すると差し替え" : "sk-...";
+  els.clearApiKeyButton.disabled = saving || state.busy || !saved;
+  els.saveSettingsButton.disabled = saving || state.busy || !hasInput;
+  els.saveSettingsButton.textContent = saving ? "保存中..." : saved ? "差し替え保存" : "保存";
+  els.settingsCloseButton.disabled = saving;
+  els.settingsCancelButton.disabled = saving;
+  els.apiKeyVisibilityButton.disabled = saving;
+  els.apiKeyInput.disabled = saving;
 }
 
 function setSettingsSaving(saving) {
-  els.apiKeyInput.disabled = saving;
-  els.clearApiKeyButton.disabled = saving || !state.snapshot?.settings?.apiKeySaved;
-  els.saveSettingsButton.disabled = saving;
-  els.settingsCloseButton.disabled = saving;
+  state.settingsSaving = saving;
+  updateSettingsDialogState();
+}
+
+function setApiKeyStatus(message, tone = "neutral") {
+  els.apiKeyStatus.textContent = message;
+  els.apiKeyStatus.dataset.tone = tone;
+}
+
+function toggleApiKeyVisibility() {
+  setApiKeyVisibility(els.apiKeyInput.type === "password");
+}
+
+function setApiKeyVisibility(visible) {
+  els.apiKeyInput.type = visible ? "text" : "password";
+  els.apiKeyVisibilityButton.classList.toggle("is-visible", visible);
+  els.apiKeyVisibilityButton.title = visible ? "隠す" : "表示";
+  els.apiKeyVisibilityButton.setAttribute("aria-label", visible ? "APIキーを隠す" : "APIキーを表示");
 }
 
 function startNewChat() {

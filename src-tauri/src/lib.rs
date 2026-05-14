@@ -98,6 +98,7 @@ struct Settings {
     comprehensive_batch_chars: usize,
     api_key_saved: bool,
     api_key_storage: String,
+    api_key_hint: Option<String>,
     #[serde(skip_serializing, skip_deserializing)]
     api_key: Option<String>,
 }
@@ -114,6 +115,7 @@ impl Default for Settings {
             comprehensive_batch_chars: DEFAULT_BATCH_CHARS,
             api_key_saved: false,
             api_key_storage: "none".to_string(),
+            api_key_hint: None,
             api_key: None,
         }
     }
@@ -4666,8 +4668,27 @@ fn load_settings(conn: &Connection) -> Result<Settings, String> {
     let (api_key, api_key_storage) = load_api_key(conn);
     settings.api_key_saved = api_key.is_some();
     settings.api_key_storage = api_key_storage;
+    settings.api_key_hint = api_key.as_deref().map(mask_api_key);
     settings.api_key = api_key;
     Ok(settings)
+}
+
+fn mask_api_key(api_key: &str) -> String {
+    let chars: Vec<char> = api_key.trim().chars().collect();
+    if chars.len() <= 8 {
+        return "保存済み".to_string();
+    }
+    let prefix: String = chars.iter().take(3).collect();
+    let suffix: String = chars
+        .iter()
+        .rev()
+        .take(4)
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}...{suffix}")
 }
 
 fn apply_simple_defaults(settings: &mut Settings) {
