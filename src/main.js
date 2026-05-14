@@ -14,6 +14,7 @@ const state = {
   snapshot: null,
   busy: false,
   currentRunId: null,
+  currentAssistantArticle: null,
   currentAssistantBody: null,
   currentAssistantRaw: "",
   currentAssistantHasAnswer: false,
@@ -43,14 +44,21 @@ document.querySelector("#app").innerHTML = `
     </aside>
 
     <main class="main">
-      <section id="messages" class="messages">
-        <article class="message assistant">
-          <div class="body markdown-body">
-            <p>資料を選択してインデックスを作成すると、選択中の資料だけを根拠に回答します。</p>
-          </div>
-        </article>
-      </section>
-      <button id="jumpToLatestButton" class="jump-latest" type="button" hidden>最新へ</button>
+      <div class="message-area">
+        <section id="messages" class="messages">
+          <article class="message assistant">
+            <div class="body markdown-body">
+              <p>資料を選択してインデックスを作成すると、選択中の資料だけを根拠に回答します。</p>
+            </div>
+          </article>
+        </section>
+        <button id="jumpToLatestButton" class="jump-latest" type="button" hidden title="最新へ" aria-label="最新へ">
+          <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+            <path d="M12 5v14"></path>
+            <path d="M19 12l-7 7-7-7"></path>
+          </svg>
+        </button>
+      </div>
 
       <form id="questionForm" class="composer">
         <textarea
@@ -61,7 +69,7 @@ document.querySelector("#app").innerHTML = `
         <div class="composer-actions">
           <button id="clearMessagesButton" type="button">履歴クリア</button>
           <button id="cancelButton" class="icon-button" type="button" disabled title="停止" aria-label="停止">
-            <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+            <svg class="action-icon stop-icon" aria-hidden="true" viewBox="0 0 24 24">
               <rect x="7" y="7" width="10" height="10" rx="1.5"></rect>
             </svg>
           </button>
@@ -80,6 +88,7 @@ document.querySelector("#app").innerHTML = `
 const $ = (selector) => document.querySelector(selector);
 
 const els = {
+  sidebar: $(".sidebar"),
   chooseSourceButton: $("#chooseSourceButton"),
   sourcePath: $("#sourcePath"),
   indexButton: $("#indexButton"),
@@ -120,10 +129,12 @@ function wireEvents() {
   els.chooseSourceButton.addEventListener("click", chooseSourceDirectory);
   els.indexButton.addEventListener("click", indexSource);
   els.selectAllButton.addEventListener("click", async () => {
+    if (state.busy) return;
     await invoke("select_all_documents");
     await refreshSnapshot();
   });
   els.clearSelectionButton.addEventListener("click", async () => {
+    if (state.busy) return;
     await invoke("clear_document_selection");
     await refreshSnapshot();
   });
@@ -165,7 +176,6 @@ function renderStats(stats) {
   els.stats.innerHTML = `
     <span>選択 ${formatNumber(stats.selectedDocumentCount)} / ${formatNumber(stats.documentCount)}</span>
     <span>${formatNumber(stats.selectedChars)}字</span>
-    <span>${formatNumber(stats.chunkCount)}チャンク</span>
   `;
 }
 
@@ -181,10 +191,10 @@ function renderFileList(documents) {
       const statusText = doc.status === "indexed" ? "読込済み" : doc.status;
       return `
         <label class="file-row">
-          <input type="checkbox" data-doc-id="${doc.id}" ${doc.selected ? "checked" : ""} />
+          <input type="checkbox" data-doc-id="${doc.id}" ${doc.selected ? "checked" : ""} ${state.busy ? "disabled" : ""} />
           <span>
             <strong>${escapeHtml(doc.fileName)}</strong>
-            <small>${formatNumber(doc.charCount)}字 / ${formatNumber(doc.chunkCount)}チャンク</small>
+            <small>${formatNumber(doc.charCount)}字</small>
             ${doc.error ? `<em>${escapeHtml(doc.error)}</em>` : ""}
           </span>
           <b class="${statusClass}">${escapeHtml(statusText)}</b>
@@ -195,6 +205,7 @@ function renderFileList(documents) {
 
   els.fileList.querySelectorAll("input[type='checkbox']").forEach((input) => {
     input.addEventListener("change", async () => {
+      if (state.busy) return;
       await invoke("set_document_selected", {
         id: Number(input.dataset.docId),
         selected: input.checked,
@@ -205,6 +216,7 @@ function renderFileList(documents) {
 }
 
 async function chooseSourceDirectory() {
+  if (state.busy) return;
   const selected = await open({
     directory: true,
     multiple: false,
@@ -250,7 +262,9 @@ async function answerQuestion() {
   addMessage("user", question);
   els.questionInput.value = "";
 
+  const answerStartedAt = performance.now();
   const assistant = addMessage("assistant", "", { markdown: true });
+  state.currentAssistantArticle = assistant;
   state.currentAssistantBody = assistant.querySelector(".body");
   state.currentRunId = null;
   state.currentAssistantRaw = "";
@@ -270,6 +284,7 @@ async function answerQuestion() {
     state.currentAssistantRaw = response.answer || state.currentAssistantRaw;
     const shouldStick = shouldAutoScroll();
     renderMarkdown(state.currentAssistantBody, state.currentAssistantRaw);
+    renderAnswerFooter(assistant, state.currentAssistantRaw, performance.now() - answerStartedAt);
     scrollMessages({ force: shouldStick });
   } catch (error) {
     const message = state.currentAssistantRaw
@@ -277,8 +292,10 @@ async function answerQuestion() {
       : `回答に失敗しました。処理は停止しました。\n\n理由: ${String(error)}`;
     const shouldStick = shouldAutoScroll();
     renderMarkdown(state.currentAssistantBody, message);
+    renderAnswerFooter(assistant, message, performance.now() - answerStartedAt, { failed: true });
     scrollMessages({ force: shouldStick });
   } finally {
+    state.currentAssistantArticle = null;
     state.currentAssistantBody = null;
     state.currentRunId = null;
     state.currentAssistantRaw = "";
@@ -320,9 +337,8 @@ function progressDetail(payload) {
     if (message.includes("制限") || message.includes("停止")) return message;
     return apiStageDetail(state.lastProgressStage);
   }
-  const total = payload.total ? `${formatNumber(payload.completed)}/${formatNumber(payload.total)}` : "";
   const elapsed = elapsedMs ? `${Math.round(elapsedMs / 1000)}秒` : "";
-  return [message, total, elapsed].filter(Boolean).join(" ・ ");
+  return [message, elapsed].filter(Boolean).join(" ・ ");
 }
 
 function apiStageDetail(stage) {
@@ -454,12 +470,44 @@ function renderMarkdown(element, source) {
   element.innerHTML = DOMPurify.sanitize(marked.parse(source || ""));
 }
 
+function renderAnswerFooter(article, text, elapsedMs, options = {}) {
+  article.querySelector(".message-footer")?.remove();
+  const footer = document.createElement("div");
+  footer.className = "message-footer";
+  footer.innerHTML = `
+    <span>${escapeHtml(options.failed ? `停止まで ${formatElapsed(elapsedMs)}` : `回答時間 ${formatElapsed(elapsedMs)}`)}</span>
+    <button class="copy-answer-button" type="button" title="コピー" aria-label="回答をコピー">
+      <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+        <rect x="9" y="9" width="10" height="10" rx="2"></rect>
+        <path d="M5 15H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"></path>
+      </svg>
+    </button>
+  `;
+  footer.querySelector(".copy-answer-button").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(text || "");
+      showToast("コピーしました", "回答をクリップボードへコピーしました。", "success");
+    } catch (error) {
+      showToast("コピーに失敗しました", String(error), "error");
+    }
+  });
+  article.append(footer);
+}
+
 function setBusy(busy) {
   state.busy = busy;
+  els.sidebar.classList.toggle("is-locked", busy);
+  els.chooseSourceButton.disabled = busy;
   els.indexButton.disabled = busy;
+  els.selectAllButton.disabled = busy;
+  els.clearSelectionButton.disabled = busy;
+  els.clearMessagesButton.disabled = busy;
   els.sendButton.disabled = busy;
   els.cancelButton.disabled = !busy;
   els.questionInput.disabled = busy;
+  els.fileList.querySelectorAll("input[type='checkbox']").forEach((input) => {
+    input.disabled = busy;
+  });
 }
 
 function shouldAutoScroll() {
@@ -486,6 +534,13 @@ function renderJumpButton() {
 
 function formatNumber(value) {
   return new Intl.NumberFormat("ja-JP").format(value || 0);
+}
+
+function formatElapsed(ms) {
+  const seconds = Math.max(0, Math.round((ms || 0) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return minutes ? `${minutes}分${rest}秒` : `${rest}秒`;
 }
 
 function escapeHtml(value) {

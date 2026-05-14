@@ -1,5 +1,5 @@
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{future::join_all, StreamExt};
 use regex::Regex;
 use reqwest::StatusCode;
 use rusqlite::types::Value;
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -26,6 +26,7 @@ const EMBEDDING_MODEL: &str = "mini-lm-ja-ngram-hash-v1";
 const EMBEDDING_DIMS: usize = 384;
 const DEFAULT_CONTEXT_CHARS: usize = 12_000;
 const DEFAULT_BATCH_CHARS: usize = 6_000;
+const MAX_EXTRACT_CONCURRENCY: usize = 3;
 const MAX_REDUCED_FACTS: usize = 120;
 const MAX_SHORT_RATE_WAIT_MS: u64 = 15_000;
 const ALLOWED_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "csv", "tsv", "json", "log", "text"];
@@ -65,7 +66,10 @@ impl AppStateInner {
 
     fn clear_task(&self, token: &Arc<AtomicBool>) {
         if let Ok(mut slot) = self.active_cancel.lock() {
-            if slot.as_ref().is_some_and(|active| Arc::ptr_eq(active, token)) {
+            if slot
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, token))
+            {
                 *slot = None;
             }
         }
@@ -589,16 +593,27 @@ fn get_app_snapshot(state: State<'_, AppStateInner>) -> Result<AppSnapshot, Stri
 }
 
 #[tauri::command]
-fn save_settings(update: SettingsUpdate, state: State<'_, AppStateInner>) -> Result<Settings, String> {
+fn save_settings(
+    update: SettingsUpdate,
+    state: State<'_, AppStateInner>,
+) -> Result<Settings, String> {
     let conn = state.conn()?;
     set_setting(&conn, "model", update.model.trim())?;
     set_setting(
         &conn,
         "thinking_enabled",
-        if update.thinking_enabled { "true" } else { "false" },
+        if update.thinking_enabled {
+            "true"
+        } else {
+            "false"
+        },
     )?;
     set_setting(&conn, "reasoning_effort", update.reasoning_effort.trim())?;
-    set_setting(&conn, "temperature", &update.temperature.clamp(0.0, 1.0).to_string())?;
+    set_setting(
+        &conn,
+        "temperature",
+        &update.temperature.clamp(0.0, 1.0).to_string(),
+    )?;
     set_setting(
         &conn,
         "max_context_chars",
@@ -607,7 +622,10 @@ fn save_settings(update: SettingsUpdate, state: State<'_, AppStateInner>) -> Res
     set_setting(
         &conn,
         "comprehensive_batch_chars",
-        &update.comprehensive_batch_chars.clamp(2_000, 16_000).to_string(),
+        &update
+            .comprehensive_batch_chars
+            .clamp(2_000, 16_000)
+            .to_string(),
     )?;
 
     if update.clear_api_key {
@@ -622,7 +640,10 @@ fn save_settings(update: SettingsUpdate, state: State<'_, AppStateInner>) -> Res
 }
 
 #[tauri::command]
-fn set_source_directory(path: String, state: State<'_, AppStateInner>) -> Result<AppSnapshot, String> {
+fn set_source_directory(
+    path: String,
+    state: State<'_, AppStateInner>,
+) -> Result<AppSnapshot, String> {
     let source = PathBuf::from(path.trim());
     if !source.is_dir() {
         return Err("指定されたsourceディレクトリが見つかりません。".to_string());
@@ -633,7 +654,11 @@ fn set_source_directory(path: String, state: State<'_, AppStateInner>) -> Result
 }
 
 #[tauri::command]
-fn set_document_selected(id: i64, selected: bool, state: State<'_, AppStateInner>) -> Result<AppSnapshot, String> {
+fn set_document_selected(
+    id: i64,
+    selected: bool,
+    state: State<'_, AppStateInner>,
+) -> Result<AppSnapshot, String> {
     let conn = state.conn()?;
     conn.execute(
         "UPDATE documents SET selected = ?1 WHERE id = ?2",
@@ -646,8 +671,11 @@ fn set_document_selected(id: i64, selected: bool, state: State<'_, AppStateInner
 #[tauri::command]
 fn select_all_documents(state: State<'_, AppStateInner>) -> Result<AppSnapshot, String> {
     let conn = state.conn()?;
-    conn.execute("UPDATE documents SET selected = 1 WHERE status != 'missing'", [])
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE documents SET selected = 1 WHERE status != 'missing'",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     get_app_snapshot(state)
 }
 
@@ -665,7 +693,10 @@ fn cancel_current_task(state: State<'_, AppStateInner>) -> Result<bool, String> 
 }
 
 #[tauri::command]
-fn index_source_directory(app: AppHandle, state: State<'_, AppStateInner>) -> Result<IndexSummary, String> {
+fn index_source_directory(
+    app: AppHandle,
+    state: State<'_, AppStateInner>,
+) -> Result<IndexSummary, String> {
     let started = Instant::now();
     let cancel = state.begin_task();
     let result = index_source_directory_inner(&app, &state, &cancel, started);
@@ -738,7 +769,10 @@ fn index_source_directory_inner(
             started,
             "index",
             "running",
-            &format!("読み込み中: {}", path.file_name().unwrap_or_default().to_string_lossy()),
+            &format!(
+                "読み込み中: {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
             None,
             idx as u64,
             total,
@@ -797,7 +831,10 @@ fn index_source_directory_inner(
 }
 
 #[tauri::command]
-fn hybrid_search(request: SearchRequest, state: State<'_, AppStateInner>) -> Result<SearchResponse, String> {
+fn hybrid_search(
+    request: SearchRequest,
+    state: State<'_, AppStateInner>,
+) -> Result<SearchResponse, String> {
     let conn = state.conn()?;
     let response = hybrid_search_internal(
         &conn,
@@ -862,7 +899,8 @@ async fn answer_question_inner(
 
     let search = {
         let conn = state.conn()?;
-        let search = hybrid_search_internal(&conn, &request.question, &request.selected_document_ids, 16)?;
+        let search =
+            hybrid_search_internal(&conn, &request.question, &request.selected_document_ids, 16)?;
         let hits_json = serde_json::to_string(&search.hits).unwrap_or_else(|_| "[]".to_string());
         conn.execute(
             "UPDATE retrieval_runs SET hits_json = ?1 WHERE id = ?2",
@@ -874,9 +912,29 @@ async fn answer_question_inner(
 
     let is_comprehensive = true;
     if is_comprehensive {
-        answer_comprehensively(app, state, &settings, request, run_id, cancel, started, search.hits).await
+        answer_comprehensively(
+            app,
+            state,
+            &settings,
+            request,
+            run_id,
+            cancel,
+            started,
+            search.hits,
+        )
+        .await
     } else {
-        answer_normally(app, state, &settings, request, run_id, cancel, started, search.hits).await
+        answer_normally(
+            app,
+            state,
+            &settings,
+            request,
+            run_id,
+            cancel,
+            started,
+            search.hits,
+        )
+        .await
     }
 }
 
@@ -914,8 +972,20 @@ async fn answer_normally(
         }),
     ];
 
-    let answer = call_deepseek(app, settings, messages, 2_000, false, true, Some(run_id), cancel).await?;
-    let audit = audit_answer(app, settings, &answer, &hits, run_id, cancel).await.ok();
+    let answer = call_deepseek(
+        app,
+        settings,
+        messages,
+        2_000,
+        false,
+        true,
+        Some(run_id),
+        cancel,
+    )
+    .await?;
+    let audit = audit_answer(app, settings, &answer, &hits, run_id, cancel)
+        .await
+        .ok();
     let conn = state.conn()?;
     save_answer(&conn, run_id, &answer, audit.as_deref())?;
     let profile = QuestionProfile::from_question(&request.question);
@@ -986,8 +1056,13 @@ async fn answer_comprehensively(
     enrich_profile_with_source_concepts(&mut profile, &chunks, &request.question);
     let mut seed_hits = {
         let conn = state.conn()?;
-        let corrected =
-            corrective_retrieval_internal(&conn, &request.question, &request.selected_document_ids, &profile, seed_hits)?;
+        let corrected = corrective_retrieval_internal(
+            &conn,
+            &request.question,
+            &request.selected_document_ids,
+            &profile,
+            seed_hits,
+        )?;
         let hits_json = serde_json::to_string(&corrected).unwrap_or_else(|_| "[]".to_string());
         conn.execute(
             "UPDATE retrieval_runs SET hits_json = ?1 WHERE id = ?2",
@@ -1004,55 +1079,22 @@ async fn answer_comprehensively(
     let total_batches = batches.len() as u64;
     let mut facts = Vec::new();
 
-    for (idx, batch) in batches.iter().enumerate() {
-        if cancel.load(AtomicOrdering::SeqCst) {
-            let conn = state.conn()?;
-            complete_run(&conn, run_id, "cancelled", Some("ユーザーがキャンセルしました"))?;
-            emit_progress(
-                app,
-                started,
-                "extract",
-                "cancelled",
-                "網羅抽出をキャンセルしました",
-                Some(run_id.to_string()),
-                idx as u64,
-                total_batches,
-                false,
-            );
-            return Err("網羅抽出をキャンセルしました。".to_string());
-        }
-
-        emit_progress(
-            app,
-            started,
-            "extract",
-            "running",
-            &format!("全チャンク確認中: batch {}/{}", idx + 1, total_batches),
-            Some(run_id.to_string()),
-            idx as u64,
-            total_batches,
-            true,
-        );
-
-        let extracted = extract_facts_from_batch(
-            app,
-            settings,
-            &request.question,
-            &profile,
-            &hierarchy,
-            batch,
-            run_id,
-            cancel,
-        )
-        .await?;
-
-        let conn = state.conn()?;
-        for fact in extracted {
-            if push_unique_fact(&mut facts, fact.clone()) {
-                insert_fact(&conn, run_id, &fact)?;
-            }
-        }
-    }
+    extract_fact_batches(
+        app,
+        state,
+        settings,
+        &request.question,
+        &profile,
+        &hierarchy,
+        &batches,
+        run_id,
+        cancel,
+        started,
+        "資料全体を確認しています",
+        "網羅抽出をキャンセルしました",
+        &mut facts,
+    )
+    .await?;
 
     let followup_queries = derive_followup_queries_from_facts(&facts, &profile);
     if !followup_queries.is_empty() {
@@ -1071,46 +1113,32 @@ async fn answer_comprehensively(
         normalize_string_list(&mut profile.terms);
         let followup_hits = {
             let conn = state.conn()?;
-            fact_guided_retrieval_internal(&conn, &request.selected_document_ids, &followup_queries)?
+            fact_guided_retrieval_internal(
+                &conn,
+                &request.selected_document_ids,
+                &followup_queries,
+            )?
         };
         merge_search_hits(&mut seed_hits, followup_hits.clone(), 48);
         let focused_chunks = focused_chunks_from_hits(&chunks, &followup_hits, 96);
-        let focused_batches = build_chunk_batches(&focused_chunks, settings.comprehensive_batch_chars);
-        for (idx, batch) in focused_batches.iter().enumerate() {
-            if cancel.load(AtomicOrdering::SeqCst) {
-                let conn = state.conn()?;
-                complete_run(&conn, run_id, "cancelled", Some("ユーザーがキャンセルしました"))?;
-                emit_progress(
-                    app,
-                    started,
-                    "extract",
-                    "cancelled",
-                    "追加抽出をキャンセルしました",
-                    Some(run_id.to_string()),
-                    idx as u64,
-                    focused_batches.len() as u64,
-                    false,
-                );
-                return Err("追加抽出をキャンセルしました。".to_string());
-            }
-            let extracted = extract_facts_from_batch(
-                app,
-                settings,
-                &request.question,
-                &profile,
-                &hierarchy,
-                batch,
-                run_id,
-                cancel,
-            )
-            .await?;
-            let conn = state.conn()?;
-            for fact in extracted {
-                if push_unique_fact(&mut facts, fact.clone()) {
-                    insert_fact(&conn, run_id, &fact)?;
-                }
-            }
-        }
+        let focused_batches =
+            build_chunk_batches(&focused_chunks, settings.comprehensive_batch_chars);
+        extract_fact_batches(
+            app,
+            state,
+            settings,
+            &request.question,
+            &profile,
+            &hierarchy,
+            &focused_batches,
+            run_id,
+            cancel,
+            started,
+            "関連箇所を再確認しています",
+            "追加抽出をキャンセルしました",
+            &mut facts,
+        )
+        .await?;
         let conn = state.conn()?;
         let hits_json = serde_json::to_string(&seed_hits).unwrap_or_else(|_| "[]".to_string());
         conn.execute(
@@ -1132,10 +1160,38 @@ async fn answer_comprehensively(
         true,
     );
 
-    let reduced_facts = reduce_facts(app, settings, &request.question, &profile, &facts, run_id, cancel).await?;
-    let mut answer =
-        synthesize_answer(app, settings, &request.question, &profile, &hierarchy, &reduced_facts, run_id, cancel).await?;
-    let mut audit = audit_facts_answer(app, settings, &request.question, &answer, &reduced_facts, run_id, cancel).await.ok();
+    let reduced_facts = reduce_facts(
+        app,
+        settings,
+        &request.question,
+        &profile,
+        &facts,
+        run_id,
+        cancel,
+    )
+    .await?;
+    let mut answer = synthesize_answer(
+        app,
+        settings,
+        &request.question,
+        &profile,
+        &hierarchy,
+        &reduced_facts,
+        run_id,
+        cancel,
+    )
+    .await?;
+    let mut audit = audit_facts_answer(
+        app,
+        settings,
+        &request.question,
+        &answer,
+        &reduced_facts,
+        run_id,
+        cancel,
+    )
+    .await
+    .ok();
 
     if let Some(audit_text) = audit.clone() {
         if audit_needs_revision(&audit_text) {
@@ -1150,15 +1206,30 @@ async fn answer_comprehensively(
                 total_batches,
                 true,
             );
-            if let Ok(revised) =
-                revise_answer_from_audit(app, settings, &request.question, &answer, &audit_text, &reduced_facts, run_id, cancel)
-                    .await
+            if let Ok(revised) = revise_answer_from_audit(
+                app,
+                settings,
+                &request.question,
+                &answer,
+                &audit_text,
+                &reduced_facts,
+                run_id,
+                cancel,
+            )
+            .await
             {
                 answer = revised;
-                let revised_audit =
-                    audit_facts_answer(app, settings, &request.question, &answer, &reduced_facts, run_id, cancel)
-                        .await
-                        .ok();
+                let revised_audit = audit_facts_answer(
+                    app,
+                    settings,
+                    &request.question,
+                    &answer,
+                    &reduced_facts,
+                    run_id,
+                    cancel,
+                )
+                .await
+                .ok();
                 audit = Some(combine_audit_json(&audit_text, revised_audit.as_deref()));
             }
         }
@@ -1262,7 +1333,11 @@ fn index_one_file(conn: &mut Connection, path: &Path) -> Result<FileIndexOutcome
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
-        if old_hash == sha256 && old_mtime == mtime_ms && old_size == metadata.len() as i64 && chunk_count > 0 {
+        if old_hash == sha256
+            && old_mtime == mtime_ms
+            && old_size == metadata.len() as i64
+            && chunk_count > 0
+        {
             return Ok(FileIndexOutcome::Skipped);
         }
     }
@@ -1328,10 +1403,16 @@ fn index_one_file(conn: &mut Connection, path: &Path) -> Result<FileIndexOutcome
     }
     tx.execute("DELETE FROM chunks WHERE document_id = ?1", params![doc_id])
         .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM section_contexts WHERE document_id = ?1", params![doc_id])
-        .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM document_contexts WHERE document_id = ?1", params![doc_id])
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM section_contexts WHERE document_id = ?1",
+        params![doc_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM document_contexts WHERE document_id = ?1",
+        params![doc_id],
+    )
+    .map_err(|e| e.to_string())?;
 
     let chunks = split_text_into_chunks(&text);
     let indexed_at = Utc::now().to_rfc3339();
@@ -1398,7 +1479,16 @@ fn index_one_file(conn: &mut Connection, path: &Path) -> Result<FileIndexOutcome
         .map_err(|e| e.to_string())?;
     }
 
-    rebuild_hierarchy_contexts(&tx, doc_id, &file_name, &path_string, char_count, &chunks, &inserted_ids, &indexed_at)?;
+    rebuild_hierarchy_contexts(
+        &tx,
+        doc_id,
+        &file_name,
+        &path_string,
+        char_count,
+        &chunks,
+        &inserted_ids,
+        &indexed_at,
+    )?;
 
     tx.execute(
         "UPDATE documents SET status = 'indexed', indexed_at = ?1, error = NULL WHERE id = ?2",
@@ -1511,7 +1601,12 @@ fn rebuild_hierarchy_contexts(
         char_count,
         chunks.len(),
         concepts.join(", "),
-        heading_index.iter().take(30).cloned().collect::<Vec<_>>().join(" / ")
+        heading_index
+            .iter()
+            .take(30)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" / ")
     );
     conn.execute(
         r#"
@@ -1590,11 +1685,20 @@ fn backfill_missing_hierarchy_contexts(conn: &Connection) -> Result<(), String> 
             continue;
         }
         let chunk_ids = pairs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        let chunks = pairs.into_iter().map(|(_, chunk)| chunk).collect::<Vec<_>>();
-        conn.execute("DELETE FROM section_contexts WHERE document_id = ?1", params![document_id])
-            .map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM document_contexts WHERE document_id = ?1", params![document_id])
-            .map_err(|e| e.to_string())?;
+        let chunks = pairs
+            .into_iter()
+            .map(|(_, chunk)| chunk)
+            .collect::<Vec<_>>();
+        conn.execute(
+            "DELETE FROM section_contexts WHERE document_id = ?1",
+            params![document_id],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM document_contexts WHERE document_id = ?1",
+            params![document_id],
+        )
+        .map_err(|e| e.to_string())?;
         rebuild_hierarchy_contexts(
             conn,
             document_id,
@@ -1647,7 +1751,8 @@ fn first_chars(text: &str, max_chars: usize) -> String {
 }
 
 fn split_text_into_chunks(text: &str) -> Vec<ChunkDraft> {
-    let heading_re = Regex::new(r"^\s*(第[0-9０-９一二三四五六七八九十百千]+(章|節|款|目|条).*)\s*$").unwrap();
+    let heading_re =
+        Regex::new(r"^\s*(第[0-9０-９一二三四五六七八九十百千]+(章|節|款|目|条).*)\s*$").unwrap();
     let bracket_re = Regex::new(r"^\s*（[^）]{1,60}）\s*$").unwrap();
     let mut sections = Vec::new();
     let mut heading_stack: Vec<String> = Vec::new();
@@ -1814,7 +1919,11 @@ fn split_long_section(section: ChunkDraft, max_chars: usize) -> Vec<ChunkDraft> 
     chunks
 }
 
-fn insert_ngram_terms(conn: &Connection, chunk_id: i64, terms: HashMap<String, f64>) -> Result<(), String> {
+fn insert_ngram_terms(
+    conn: &Connection,
+    chunk_id: i64,
+    terms: HashMap<String, f64>,
+) -> Result<(), String> {
     let mut stmt = conn
         .prepare(
             r#"
@@ -1909,12 +2018,16 @@ fn hybrid_search_internal(
 
     let final_ids: Vec<i64> = scores.keys().copied().collect();
     let final_records = load_chunk_records(conn, &final_ids)?;
-    let final_map: HashMap<i64, ChunkRecord> = final_records.into_iter().map(|r| (r.id, r)).collect();
+    let final_map: HashMap<i64, ChunkRecord> =
+        final_records.into_iter().map(|r| (r.id, r)).collect();
     let mut hits = Vec::new();
 
     for (chunk_id, parts) in scores.iter_mut() {
         if let Some(record) = final_map.get(chunk_id) {
-            parts.exact_bonus = parts.exact_bonus.max(exact_bonus(query, &query_terms, &record.content));
+            parts.exact_bonus =
+                parts
+                    .exact_bonus
+                    .max(exact_bonus(query, &query_terms, &record.content));
             parts.heading_bonus = parts
                 .heading_bonus
                 .max(exact_bonus(query, &query_terms, &record.heading_path) * 1.4);
@@ -2042,7 +2155,10 @@ fn run_ngram_search(
         "#,
         doc_placeholders, term_placeholders
     );
-    let mut values: Vec<Value> = selected_doc_ids.iter().map(|id| Value::Integer(*id)).collect();
+    let mut values: Vec<Value> = selected_doc_ids
+        .iter()
+        .map(|id| Value::Integer(*id))
+        .collect();
     values.extend(terms.into_iter().map(Value::Text));
 
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -2051,7 +2167,8 @@ fn run_ngram_search(
             Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 fn run_vector_search(
@@ -2073,7 +2190,10 @@ fn run_vector_search(
         doc_placeholders,
         selected_doc_ids.len() + 1
     );
-    let mut values: Vec<Value> = selected_doc_ids.iter().map(|id| Value::Integer(*id)).collect();
+    let mut values: Vec<Value> = selected_doc_ids
+        .iter()
+        .map(|id| Value::Integer(*id))
+        .collect();
     values.push(Value::Text(EMBEDDING_MODEL.to_string()));
     let query_vector = embedding_for_text(query);
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -2097,7 +2217,12 @@ fn run_vector_search(
     Ok((scored, scanned))
 }
 
-fn apply_ranking(scores: &mut HashMap<i64, ScoreParts>, ranking: &[(i64, f64)], kind: &str, weight: f64) {
+fn apply_ranking(
+    scores: &mut HashMap<i64, ScoreParts>,
+    ranking: &[(i64, f64)],
+    kind: &str,
+    weight: f64,
+) {
     for (rank, (chunk_id, raw_score)) in ranking.iter().enumerate() {
         let parts = scores.entry(*chunk_id).or_default();
         parts.rrf += weight / (60.0 + rank as f64 + 1.0);
@@ -2124,12 +2249,15 @@ fn selected_document_ids(conn: &Connection, requested_doc_ids: &[i64]) -> Result
         return Ok(requested_doc_ids.to_vec());
     }
     let mut stmt = conn
-        .prepare("SELECT id FROM documents WHERE selected = 1 AND status = 'indexed' ORDER BY file_name")
+        .prepare(
+            "SELECT id FROM documents WHERE selected = 1 AND status = 'indexed' ORDER BY file_name",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| row.get::<_, i64>(0))
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 fn load_chunk_records(conn: &Connection, chunk_ids: &[i64]) -> Result<Vec<ChunkRecord>, String> {
@@ -2165,10 +2293,14 @@ fn load_chunk_records(conn: &Connection, chunk_ids: &[i64]) -> Result<Vec<ChunkR
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
-fn load_selected_chunks(conn: &Connection, requested_doc_ids: &[i64]) -> Result<Vec<ChunkRecord>, String> {
+fn load_selected_chunks(
+    conn: &Connection,
+    requested_doc_ids: &[i64],
+) -> Result<Vec<ChunkRecord>, String> {
     let doc_ids = selected_document_ids(conn, requested_doc_ids)?;
     if doc_ids.is_empty() {
         return Ok(vec![]);
@@ -2203,7 +2335,8 @@ fn load_selected_chunks(conn: &Connection, requested_doc_ids: &[i64]) -> Result<
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 fn load_hierarchy_context(
@@ -2314,11 +2447,11 @@ fn filter_hierarchy_sections(
         if terms.iter().any(|term| section.heading_path.contains(term)) {
             score += 4.0;
         }
-        if section
-            .concepts
-            .iter()
-            .any(|concept| terms.iter().any(|term| concept.contains(term) || term.contains(concept)))
-        {
+        if section.concepts.iter().any(|concept| {
+            terms
+                .iter()
+                .any(|term| concept.contains(term) || term.contains(concept))
+        }) {
             score += 4.0;
         }
         if profile.is_broad {
@@ -2360,7 +2493,10 @@ fn build_batch_hierarchy_context(batch: &[ChunkRecord], hierarchy: &HierarchyCon
         return "階層文脈なし".to_string();
     }
     let batch_chunk_ids = batch.iter().map(|chunk| chunk.id).collect::<HashSet<_>>();
-    let batch_doc_ids = batch.iter().map(|chunk| chunk.document_id).collect::<HashSet<_>>();
+    let batch_doc_ids = batch
+        .iter()
+        .map(|chunk| chunk.document_id)
+        .collect::<HashSet<_>>();
     let mut out = String::new();
     if !hierarchy.corpus_concepts.is_empty() {
         out.push_str(&format!(
@@ -2387,7 +2523,12 @@ fn build_batch_hierarchy_context(batch: &[ChunkRecord], hierarchy: &HierarchyCon
             doc.path,
             doc.chunk_count,
             doc.char_count,
-            doc.concepts.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
+            doc.concepts
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
             doc.summary_text
         ));
     }
@@ -2397,10 +2538,13 @@ fn build_batch_hierarchy_context(batch: &[ChunkRecord], hierarchy: &HierarchyCon
         if !batch_doc_ids.contains(&section.document_id) {
             continue;
         }
-        let intersects = section.chunk_ids.iter().any(|id| batch_chunk_ids.contains(id));
-        let same_heading = batch
+        let intersects = section
+            .chunk_ids
             .iter()
-            .any(|chunk| chunk.document_id == section.document_id && chunk.heading_path == section.heading_path);
+            .any(|id| batch_chunk_ids.contains(id));
+        let same_heading = batch.iter().any(|chunk| {
+            chunk.document_id == section.document_id && chunk.heading_path == section.heading_path
+        });
         if !intersects && !same_heading {
             continue;
         }
@@ -2411,7 +2555,13 @@ fn build_batch_hierarchy_context(batch: &[ChunkRecord], hierarchy: &HierarchyCon
             section.heading_path,
             section.char_start,
             section.char_end,
-            section.concepts.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
+            section
+                .concepts
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
             section.summary_text
         ));
         included += 1;
@@ -2422,7 +2572,10 @@ fn build_batch_hierarchy_context(batch: &[ChunkRecord], hierarchy: &HierarchyCon
     out
 }
 
-fn build_answer_hierarchy_context(hierarchy: &HierarchyContext, profile: &QuestionProfile) -> String {
+fn build_answer_hierarchy_context(
+    hierarchy: &HierarchyContext,
+    profile: &QuestionProfile,
+) -> String {
     if hierarchy.documents.is_empty() && hierarchy.sections.is_empty() {
         return "階層文脈なし".to_string();
     }
@@ -2445,8 +2598,18 @@ fn build_answer_hierarchy_context(hierarchy: &HierarchyContext, profile: &Questi
             doc.path,
             doc.chunk_count,
             doc.char_count,
-            doc.concepts.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
-            doc.heading_index.iter().take(12).cloned().collect::<Vec<_>>().join(" / "),
+            doc.concepts
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            doc.heading_index
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" / "),
             doc.summary_text
         ));
     }
@@ -2458,7 +2621,13 @@ fn build_answer_hierarchy_context(hierarchy: &HierarchyContext, profile: &Questi
                 section.file_name,
                 section.path,
                 section.heading_path,
-                section.concepts.iter().take(16).cloned().collect::<Vec<_>>().join(", "),
+                section
+                    .concepts
+                    .iter()
+                    .take(16)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 section.summary_text
             ));
         }
@@ -2486,6 +2655,214 @@ fn build_chunk_batches(chunks: &[ChunkRecord], max_chars: usize) -> Vec<Vec<Chun
     batches
 }
 
+struct BatchExtraction {
+    index: usize,
+    batch: Vec<ChunkRecord>,
+    result: Result<Vec<ExtractedFact>, String>,
+}
+
+async fn extract_fact_batches(
+    app: &AppHandle,
+    state: &AppStateInner,
+    settings: &Settings,
+    question: &str,
+    profile: &QuestionProfile,
+    hierarchy: &HierarchyContext,
+    batches: &[Vec<ChunkRecord>],
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+    started: Instant,
+    label: &str,
+    cancel_message: &str,
+    facts: &mut Vec<ExtractedFact>,
+) -> Result<(), String> {
+    if batches.is_empty() {
+        return Ok(());
+    }
+
+    let total = batches.len() as u64;
+    let mut completed = 0u64;
+    let mut concurrency = MAX_EXTRACT_CONCURRENCY.min(batches.len()).max(1);
+    let mut pending = batches
+        .iter()
+        .cloned()
+        .enumerate()
+        .collect::<VecDeque<(usize, Vec<ChunkRecord>)>>();
+
+    while !pending.is_empty() {
+        if cancel.load(AtomicOrdering::SeqCst) {
+            let conn = state.conn()?;
+            complete_run(
+                &conn,
+                run_id,
+                "cancelled",
+                Some("ユーザーがキャンセルしました"),
+            )?;
+            emit_progress(
+                app,
+                started,
+                "extract",
+                "cancelled",
+                cancel_message,
+                Some(run_id.to_string()),
+                completed,
+                total,
+                false,
+            );
+            return Err(format!("{cancel_message}。"));
+        }
+
+        emit_progress(
+            app,
+            started,
+            "extract",
+            "running",
+            &format!("{label}（最大{}並列）", concurrency),
+            Some(run_id.to_string()),
+            completed,
+            total,
+            true,
+        );
+
+        let wave_size = concurrency.min(pending.len());
+        let mut wave = Vec::with_capacity(wave_size);
+        for _ in 0..wave_size {
+            if let Some(item) = pending.pop_front() {
+                wave.push(item);
+            }
+        }
+
+        let tasks = wave.into_iter().map(|(index, batch)| {
+            let app = app.clone();
+            let settings = settings.clone();
+            let question = question.to_string();
+            let profile = profile.clone();
+            let hierarchy = hierarchy.clone();
+            let run_id = run_id.to_string();
+            let cancel = cancel.clone();
+            let retry_batch = batch.clone();
+            async move {
+                let result = extract_facts_from_batch(
+                    &app, &settings, &question, &profile, &hierarchy, &batch, &run_id, &cancel,
+                )
+                .await;
+                BatchExtraction {
+                    index,
+                    batch: retry_batch,
+                    result,
+                }
+            }
+        });
+
+        let results = join_all(tasks).await;
+        let mut rate_limited = Vec::new();
+
+        for item in results {
+            if cancel.load(AtomicOrdering::SeqCst) {
+                let conn = state.conn()?;
+                complete_run(
+                    &conn,
+                    run_id,
+                    "cancelled",
+                    Some("ユーザーがキャンセルしました"),
+                )?;
+                emit_progress(
+                    app,
+                    started,
+                    "extract",
+                    "cancelled",
+                    cancel_message,
+                    Some(run_id.to_string()),
+                    completed,
+                    total,
+                    false,
+                );
+                return Err(format!("{cancel_message}。"));
+            }
+
+            match item.result {
+                Ok(extracted) => {
+                    let conn = state.conn()?;
+                    for fact in extracted {
+                        if push_unique_fact(facts, fact.clone()) {
+                            insert_fact(&conn, run_id, &fact)?;
+                        }
+                    }
+                    completed += 1;
+                }
+                Err(error) if is_rate_limit_error(&error) => {
+                    rate_limited.push((item.index, item.batch, error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if !rate_limited.is_empty() {
+            for (index, batch, _) in rate_limited.iter().rev() {
+                pending.push_front((*index, batch.clone()));
+            }
+
+            if concurrency > 1 {
+                let previous = concurrency;
+                let drop_count = rate_limited.len().max(1).min(concurrency - 1);
+                concurrency -= drop_count;
+                emit_progress(
+                    app,
+                    started,
+                    "extract",
+                    "running",
+                    &format!(
+                        "DeepSeekの制限を検知したため、並列数を{}から{}に下げて続行します",
+                        previous, concurrency
+                    ),
+                    Some(run_id.to_string()),
+                    completed,
+                    total,
+                    true,
+                );
+                sleep(Duration::from_millis(1_500)).await;
+                continue;
+            }
+
+            emit_progress(
+                app,
+                started,
+                "extract",
+                "stopped",
+                "DeepSeekの制限に達したため停止しました",
+                Some(run_id.to_string()),
+                completed,
+                total,
+                false,
+            );
+            return Err("rate_limit: DeepSeekの制限に達しました。並列数を1まで下げても続行できないため、少し時間を置いて再実行してください。".to_string());
+        }
+
+        emit_progress(
+            app,
+            started,
+            "extract",
+            "running",
+            &format!("{label}（最大{}並列）", concurrency),
+            Some(run_id.to_string()),
+            completed,
+            total,
+            true,
+        );
+    }
+
+    Ok(())
+}
+
+fn is_rate_limit_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.starts_with("rate_limit:")
+        || lower.contains("too many requests")
+        || lower.contains("429")
+        || lower.contains("rate limit")
+        || error.contains("制限")
+}
+
 fn corrective_retrieval_internal(
     conn: &Connection,
     question: &str,
@@ -2507,7 +2884,15 @@ fn corrective_retrieval_internal(
     queries.extend(profile.lower_concepts.iter().take(30).cloned());
     queries.extend(profile.aspects.iter().take(12).cloned());
     if profile.terms.len() > 1 {
-        queries.push(profile.terms.iter().take(8).cloned().collect::<Vec<_>>().join(" "));
+        queries.push(
+            profile
+                .terms
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     normalize_string_list(&mut queries);
 
@@ -2540,7 +2925,10 @@ fn corrective_retrieval_internal(
     Ok(hits)
 }
 
-fn derive_followup_queries_from_facts(facts: &[ExtractedFact], profile: &QuestionProfile) -> Vec<String> {
+fn derive_followup_queries_from_facts(
+    facts: &[ExtractedFact],
+    profile: &QuestionProfile,
+) -> Vec<String> {
     let existing = profile.search_terms().into_iter().collect::<HashSet<_>>();
     let mut queries = Vec::new();
     for fact in facts.iter().take(120) {
@@ -2608,11 +2996,18 @@ fn merge_search_hits(base: &mut Vec<SearchHit>, incoming: Vec<SearchHit>, limit:
     *base = hits;
 }
 
-fn focused_chunks_from_hits(chunks: &[ChunkRecord], hits: &[SearchHit], max_chunks: usize) -> Vec<ChunkRecord> {
+fn focused_chunks_from_hits(
+    chunks: &[ChunkRecord],
+    hits: &[SearchHit],
+    max_chunks: usize,
+) -> Vec<ChunkRecord> {
     if hits.is_empty() {
         return Vec::new();
     }
-    let by_id = chunks.iter().map(|chunk| (chunk.id, chunk)).collect::<HashMap<_, _>>();
+    let by_id = chunks
+        .iter()
+        .map(|chunk| (chunk.id, chunk))
+        .collect::<HashMap<_, _>>();
     let mut selected_ids = Vec::new();
     for hit in hits {
         if let Some(chunk) = by_id.get(&hit.chunk_id) {
@@ -2666,7 +3061,11 @@ fn fact_identity(fact: &ExtractedFact) -> String {
     )
 }
 
-fn enrich_profile_with_source_concepts(profile: &mut QuestionProfile, chunks: &[ChunkRecord], question: &str) {
+fn enrich_profile_with_source_concepts(
+    profile: &mut QuestionProfile,
+    chunks: &[ChunkRecord],
+    question: &str,
+) {
     let mut concepts = source_derived_concepts(chunks, question, &profile.terms);
     profile.lower_concepts.append(&mut concepts);
     normalize_string_list(&mut profile.lower_concepts);
@@ -2675,7 +3074,11 @@ fn enrich_profile_with_source_concepts(profile: &mut QuestionProfile, chunks: &[
     }
 }
 
-fn source_derived_concepts(chunks: &[ChunkRecord], question: &str, terms: &[String]) -> Vec<String> {
+fn source_derived_concepts(
+    chunks: &[ChunkRecord],
+    question: &str,
+    terms: &[String],
+) -> Vec<String> {
     let question_terms = meaningful_question_terms(question, terms);
     let mut scores: HashMap<String, f64> = HashMap::new();
 
@@ -2711,7 +3114,9 @@ fn source_derived_concepts(chunks: &[ChunkRecord], question: &str, terms: &[Stri
     let broad = is_broad_question(question, terms);
     let mut ranked = scores
         .into_iter()
-        .filter(|(concept, score)| broad || *score >= 8.0 || concept_matches_question(concept, &question_terms))
+        .filter(|(concept, score)| {
+            broad || *score >= 8.0 || concept_matches_question(concept, &question_terms)
+        })
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
@@ -2784,25 +3189,8 @@ fn is_japanese_word_char(ch: char) -> bool {
 
 fn concept_suffixes() -> &'static [&'static str] {
     &[
-        "手当",
-        "休暇",
-        "休業",
-        "規程",
-        "規則",
-        "制度",
-        "給与",
-        "勤務",
-        "旅費",
-        "届出",
-        "申請",
-        "許可",
-        "承認",
-        "控除",
-        "賞与",
-        "退職",
-        "手続",
-        "補助",
-        "扶養",
+        "手当", "休暇", "休業", "規程", "規則", "制度", "給与", "勤務", "旅費", "届出", "申請",
+        "許可", "承認", "控除", "賞与", "退職", "手続", "補助", "扶養",
     ]
 }
 
@@ -2820,7 +3208,10 @@ fn concept_start_index(chars: &[char], suffix_start: usize) -> usize {
 }
 
 fn is_concept_connector(ch: char) -> bool {
-    matches!(ch, 'の' | 'に' | 'を' | 'は' | 'が' | 'と' | '及' | 'び' | '又')
+    matches!(
+        ch,
+        'の' | 'に' | 'を' | 'は' | 'が' | 'と' | '及' | 'び' | '又'
+    )
 }
 
 fn is_concept_boundary(ch: char) -> bool {
@@ -2844,7 +3235,9 @@ fn is_valid_source_concept(concept: &str) -> bool {
     len >= 2
         && len <= 18
         && !is_stop_term(concept)
-        && !concept.chars().all(|ch| matches!(ch, '第' | '章' | '節' | '条' | '項'))
+        && !concept
+            .chars()
+            .all(|ch| matches!(ch, '第' | '章' | '節' | '条' | '項'))
 }
 
 fn heading_mentions_concept(heading_path: &str, concept: &str) -> bool {
@@ -2872,7 +3265,8 @@ fn normalize_heading_concept(raw: &str) -> String {
             .trim()
             .to_string();
     }
-    let article_re = Regex::new(r"^第[0-9０-９一二三四五六七八九十百千]+(章|節|款|目|条)\s*").unwrap();
+    let article_re =
+        Regex::new(r"^第[0-9０-９一二三四五六七八九十百千]+(章|節|款|目|条)\s*").unwrap();
     text = article_re.replace(&text, "").trim().to_string();
     text.trim_matches(|c: char| matches!(c, '「' | '」' | '"' | '\'' | ' ' | '\t'))
         .to_string()
@@ -2887,9 +3281,9 @@ fn meaningful_question_terms(question: &str, terms: &[String]) -> Vec<String> {
 }
 
 fn concept_matches_question(concept: &str, terms: &[String]) -> bool {
-    terms.iter().any(|term| {
-        term.chars().count() >= 2 && (concept.contains(term) || term.contains(concept))
-    })
+    terms
+        .iter()
+        .any(|term| term.chars().count() >= 2 && (concept.contains(term) || term.contains(concept)))
 }
 
 fn is_broad_question(question: &str, terms: &[String]) -> bool {
@@ -2944,15 +3338,7 @@ fn is_stop_term(term: &str) -> bool {
 fn is_generic_concept(concept: &str) -> bool {
     matches!(
         concept,
-        "総則"
-            | "目的"
-            | "定義"
-            | "適用範囲"
-            | "雑則"
-            | "附則"
-            | "施行"
-            | "改正"
-            | "経過措置"
+        "総則" | "目的" | "定義" | "適用範囲" | "雑則" | "附則" | "施行" | "改正" | "経過措置"
     )
 }
 
@@ -2979,7 +3365,17 @@ async fn build_question_profile(
         }),
         json!({"role": "user", "content": question}),
     ];
-    let content = call_deepseek(app, settings, messages, 800, true, false, Some(run_id), cancel).await?;
+    let content = call_deepseek(
+        app,
+        settings,
+        messages,
+        800,
+        true,
+        false,
+        Some(run_id),
+        cancel,
+    )
+    .await?;
     let mut terms = extract_terms(question);
     let mut aspects = Vec::new();
     let mut is_broad = is_broad_question(question, &terms);
@@ -3032,14 +3428,25 @@ async fn extract_facts_from_batch(
     for chunk in batch {
         source.push_str(&format!(
             "\n[C{}] file={} chars={}-{} heading={}\n{}\n",
-            chunk.id, chunk.file_name, chunk.char_start, chunk.char_end, chunk.heading_path, chunk.content
+            chunk.id,
+            chunk.file_name,
+            chunk.char_start,
+            chunk.char_end,
+            chunk.heading_path,
+            chunk.content
         ));
     }
     let profile_terms = profile.search_terms();
     let lower_concepts = if profile.lower_concepts.is_empty() {
         "なし".to_string()
     } else {
-        profile.lower_concepts.iter().take(80).cloned().collect::<Vec<_>>().join(", ")
+        profile
+            .lower_concepts
+            .iter()
+            .take(80)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let hierarchy_context = build_batch_hierarchy_context(batch, hierarchy);
     let messages = vec![
@@ -3060,12 +3467,26 @@ async fn extract_facts_from_batch(
             )
         }),
     ];
-    let content = call_deepseek(app, settings, messages, 1_400, true, false, Some(run_id), cancel).await?;
-    let parsed = serde_json::from_str::<JsonValue>(&content).unwrap_or_else(|_| json!({"facts":[]}));
+    let content = call_deepseek(
+        app,
+        settings,
+        messages,
+        1_400,
+        true,
+        false,
+        Some(run_id),
+        cancel,
+    )
+    .await?;
+    let parsed =
+        serde_json::from_str::<JsonValue>(&content).unwrap_or_else(|_| json!({"facts":[]}));
     let mut out = Vec::new();
     if let Some(items) = parsed.get("facts").and_then(|v| v.as_array()) {
         for item in items {
-            let chunk_id = item.get("chunk_id").and_then(|v| v.as_i64()).unwrap_or_default();
+            let chunk_id = item
+                .get("chunk_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default();
             let statement = item
                 .get("statement")
                 .and_then(|v| v.as_str())
@@ -3139,7 +3560,11 @@ fn normalize_polarity(raw: &str, condition: &str, effect: &str) -> String {
     if !condition.trim().is_empty() {
         return "conditional".to_string();
     }
-    if effect.contains("ない") || effect.contains("対象外") || effect.contains("除く") || effect.contains("禁止") {
+    if effect.contains("ない")
+        || effect.contains("対象外")
+        || effect.contains("除く")
+        || effect.contains("禁止")
+    {
         return "negative".to_string();
     }
     "positive".to_string()
@@ -3154,7 +3579,13 @@ fn normalize_confidence(raw: &str) -> String {
     }
 }
 
-fn compose_fact_statement(subject: &str, object: &str, condition: &str, effect: &str, exception: &str) -> String {
+fn compose_fact_statement(
+    subject: &str,
+    object: &str,
+    condition: &str,
+    effect: &str,
+    exception: &str,
+) -> String {
     let mut parts = Vec::new();
     if !subject.trim().is_empty() {
         parts.push(format!("subject={}", subject.trim()));
@@ -3217,7 +3648,13 @@ async fn reduce_facts(
     let lower_concepts = if profile.lower_concepts.is_empty() {
         "なし".to_string()
     } else {
-        profile.lower_concepts.iter().take(80).cloned().collect::<Vec<_>>().join(", ")
+        profile
+            .lower_concepts
+            .iter()
+            .take(80)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let messages = vec![
         json!({
@@ -3226,7 +3663,17 @@ async fn reduce_facts(
         }),
         json!({"role":"user","content":format!("質問:\n{}\n\n広い質問か:\n{}\n\nsource由来の下位概念候補:\n{}\n\n残す最大件数:\n{}\n\nFACTS:\n{}", question, profile.is_broad, lower_concepts, MAX_REDUCED_FACTS, source)}),
     ];
-    let content = call_deepseek(app, settings, messages, 1_200, true, false, Some(run_id), cancel).await?;
+    let content = call_deepseek(
+        app,
+        settings,
+        messages,
+        1_200,
+        true,
+        false,
+        Some(run_id),
+        cancel,
+    )
+    .await?;
     let parsed = serde_json::from_str::<JsonValue>(&content).unwrap_or_else(|_| json!({}));
     let mut reduced = Vec::new();
     if let Some(indexes) = parsed.get("keep_indexes").and_then(|v| v.as_array()) {
@@ -3266,7 +3713,13 @@ async fn synthesize_answer(
     let lower_concepts = if profile.lower_concepts.is_empty() {
         "なし".to_string()
     } else {
-        profile.lower_concepts.iter().take(80).cloned().collect::<Vec<_>>().join(", ")
+        profile
+            .lower_concepts
+            .iter()
+            .take(80)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let hierarchy_context = build_answer_hierarchy_context(hierarchy, profile);
     let messages = vec![
@@ -3286,7 +3739,17 @@ async fn synthesize_answer(
             )
         }),
     ];
-    call_deepseek(app, settings, messages, 3_500, false, true, Some(run_id), cancel).await
+    call_deepseek(
+        app,
+        settings,
+        messages,
+        3_500,
+        false,
+        true,
+        Some(run_id),
+        cancel,
+    )
+    .await
 }
 
 async fn audit_answer(
@@ -3302,7 +3765,17 @@ async fn audit_answer(
         json!({"role":"system","content":"回答の各主張がSOURCEに支えられているか検査し、JSONだけで返してください。形式: {\"unsupported_claims\":[\"...\"],\"verdict\":\"pass|warning|fail\"}"}),
         json!({"role":"user","content":format!("ANSWER:\n{}\n\nSOURCE:\n{}", answer, source)}),
     ];
-    call_deepseek(app, settings, messages, 1_000, true, false, Some(run_id), cancel).await
+    call_deepseek(
+        app,
+        settings,
+        messages,
+        1_000,
+        true,
+        false,
+        Some(run_id),
+        cancel,
+    )
+    .await
 }
 
 async fn audit_facts_answer(
@@ -3322,7 +3795,17 @@ async fn audit_facts_answer(
         json!({"role":"system","content":"回答の各主張がFACTSに支えられているか検査し、JSONだけで返してください。unsupported_claims はFACTSにない主張、relationship_errors は subject/object/condition/effect の関係ミス、scope_errors はFACTSより広い範囲への一般化、polarity_errors は肯定/否定/条件付きの反転や言い過ぎ、insufficient_evidence_overreach は質問範囲外の根拠不足列挙です。形式: {\"unsupported_claims\":[\"...\"],\"relationship_errors\":[{\"claim\":\"...\",\"problem\":\"...\",\"supported_fact_ids\":[\"F1\"]}],\"scope_errors\":[{\"claim\":\"...\",\"problem\":\"...\",\"supported_fact_ids\":[\"F2\"]}],\"polarity_errors\":[{\"claim\":\"...\",\"problem\":\"...\",\"supported_fact_ids\":[\"F3\"]}],\"insufficient_evidence_overreach\":[\"...\"],\"verdict\":\"pass|warning|fail\"}"}),
         json!({"role":"user","content":format!("QUESTION:\n{}\n\nANSWER:\n{}\n\nFACTS:\n{}", question, answer, source)}),
     ];
-    call_deepseek(app, settings, messages, 1_500, true, false, Some(run_id), cancel).await
+    call_deepseek(
+        app,
+        settings,
+        messages,
+        1_500,
+        true,
+        false,
+        Some(run_id),
+        cancel,
+    )
+    .await
 }
 
 async fn revise_answer_from_audit(
@@ -3349,7 +3832,17 @@ async fn revise_answer_from_audit(
             "content": format!("QUESTION:\n{}\n\nCURRENT_ANSWER:\n{}\n\nAUDIT:\n{}\n\nFACTS:\n{}", question, answer, audit, source)
         }),
     ];
-    call_deepseek(app, settings, messages, 3_000, false, true, Some(run_id), cancel).await
+    call_deepseek(
+        app,
+        settings,
+        messages,
+        3_000,
+        false,
+        true,
+        Some(run_id),
+        cancel,
+    )
+    .await
 }
 
 fn format_fact_for_prompt(index: usize, fact: &ExtractedFact) -> String {
@@ -3404,9 +3897,12 @@ fn audit_needs_revision(audit: &str) -> bool {
 }
 
 fn combine_audit_json(initial: &str, final_audit: Option<&str>) -> String {
-    let initial_value = serde_json::from_str::<JsonValue>(initial).unwrap_or_else(|_| json!({"raw": initial}));
+    let initial_value =
+        serde_json::from_str::<JsonValue>(initial).unwrap_or_else(|_| json!({"raw": initial}));
     let final_value = final_audit
-        .map(|text| serde_json::from_str::<JsonValue>(text).unwrap_or_else(|_| json!({"raw": text})))
+        .map(|text| {
+            serde_json::from_str::<JsonValue>(text).unwrap_or_else(|_| json!({"raw": text}))
+        })
         .unwrap_or_else(|| json!({"error": "re-audit failed"}));
     json!({
         "revision_applied": true,
@@ -3475,7 +3971,10 @@ async fn call_deepseek(
                     emit_api_status(
                         app,
                         run_id,
-                        &format!("DeepSeek制限により{}秒待機しています", (wait_ms + 999) / 1000),
+                        &format!(
+                            "DeepSeek制限により{}秒待機しています",
+                            (wait_ms + 999) / 1000
+                        ),
                         attempt,
                         true,
                     );
@@ -3617,7 +4116,13 @@ fn parse_retry_after_ms(raw: &str) -> Option<u64> {
     raw.trim().parse::<u64>().ok().map(|seconds| seconds * 1000)
 }
 
-fn emit_api_status(app: &AppHandle, run_id: Option<&str>, message: &str, attempt: usize, can_cancel: bool) {
+fn emit_api_status(
+    app: &AppHandle,
+    run_id: Option<&str>,
+    message: &str,
+    attempt: usize,
+    can_cancel: bool,
+) {
     let _ = app.emit(
         "task-progress",
         ProgressPayload {
@@ -3687,7 +4192,12 @@ fn insert_run(
     Ok(())
 }
 
-fn complete_run(conn: &Connection, run_id: &str, status: &str, error: Option<&str>) -> Result<(), String> {
+fn complete_run(
+    conn: &Connection,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
     conn.execute(
         "UPDATE retrieval_runs SET status = ?1, completed_at = ?2, error = ?3 WHERE id = ?4",
         params![status, Utc::now().to_rfc3339(), error, run_id],
@@ -3706,7 +4216,12 @@ fn insert_fact(conn: &Connection, run_id: &str, fact: &ExtractedFact) -> Result<
     Ok(())
 }
 
-fn save_answer(conn: &Connection, run_id: &str, answer: &str, audit: Option<&str>) -> Result<(), String> {
+fn save_answer(
+    conn: &Connection,
+    run_id: &str,
+    answer: &str,
+    audit: Option<&str>,
+) -> Result<(), String> {
     conn.execute(
         "INSERT INTO answers(run_id, answer, audit_json, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![run_id, answer, audit, Utc::now().to_rfc3339()],
@@ -3738,7 +4253,10 @@ fn default_evaluation_items() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         ("手当はどうなっていますか", vec!["手当"]),
         ("休暇はどうなっていますか", vec!["休暇"]),
-        ("申請や届出の手続きはどうなっていますか", vec!["申請", "届出", "手続"]),
+        (
+            "申請や届出の手続きはどうなっていますか",
+            vec!["申請", "届出", "手続"],
+        ),
         ("対象者や対象外はどうなっていますか", vec!["対象", "対象外"]),
         ("例外やただし書きはありますか", vec!["例外", "ただし"]),
     ]
@@ -3755,7 +4273,8 @@ fn record_evaluation_metrics(
     hits: &[SearchHit],
     hierarchy: &HierarchyContext,
 ) -> Result<(), String> {
-    let metrics = compute_evaluation_metrics(question, profile, facts, answer, audit, hits, hierarchy);
+    let metrics =
+        compute_evaluation_metrics(question, profile, facts, answer, audit, hits, hierarchy);
     let evaluation_item_id = find_evaluation_item_id(conn, question)?;
     let metadata = json!({
         "profile_terms": profile.terms,
@@ -3814,8 +4333,13 @@ fn compute_evaluation_metrics(
     hits: &[SearchHit],
     hierarchy: &HierarchyContext,
 ) -> EvaluationMetrics {
-    let (unsupported_count, relationship_error_count, scope_error_count, polarity_error_count, verdict) =
-        audit_error_counts(audit);
+    let (
+        unsupported_count,
+        relationship_error_count,
+        scope_error_count,
+        polarity_error_count,
+        verdict,
+    ) = audit_error_counts(audit);
     let concept_coverage = compute_concept_coverage(profile, facts, answer);
     let context_recall = compute_context_recall(profile, facts, hits, hierarchy, concept_coverage);
     let faithfulness = compute_faithfulness_score(
@@ -3857,10 +4381,17 @@ fn audit_error_counts(audit: Option<&str>) -> (usize, usize, usize, usize, Strin
 }
 
 fn json_array_len(value: &JsonValue, key: &str) -> usize {
-    value.get(key).and_then(|v| v.as_array()).map_or(0, Vec::len)
+    value
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map_or(0, Vec::len)
 }
 
-fn compute_concept_coverage(profile: &QuestionProfile, facts: &[ExtractedFact], answer: &str) -> f64 {
+fn compute_concept_coverage(
+    profile: &QuestionProfile,
+    facts: &[ExtractedFact],
+    answer: &str,
+) -> f64 {
     if profile.lower_concepts.is_empty() {
         return if facts.is_empty() { 0.0 } else { 1.0 };
     }
@@ -3889,7 +4420,10 @@ fn compute_context_recall(
     if facts.is_empty() {
         return 0.0;
     }
-    let fact_chunk_ids = facts.iter().map(|fact| fact.chunk_id).collect::<HashSet<_>>();
+    let fact_chunk_ids = facts
+        .iter()
+        .map(|fact| fact.chunk_id)
+        .collect::<HashSet<_>>();
     let hit_chunk_ids = hits.iter().map(|hit| hit.chunk_id).collect::<HashSet<_>>();
     let hit_overlap = if hit_chunk_ids.is_empty() {
         0.5
@@ -3902,8 +4436,16 @@ fn compute_context_recall(
             fact_chunk_ids.len().max(1),
         )
     };
-    let hierarchy_bonus = if hierarchy.sections.is_empty() { 0.0 } else { 0.15 };
-    let broad_weight = if profile.is_broad { concept_coverage * 0.55 } else { 0.35 };
+    let hierarchy_bonus = if hierarchy.sections.is_empty() {
+        0.0
+    } else {
+        0.15
+    };
+    let broad_weight = if profile.is_broad {
+        concept_coverage * 0.55
+    } else {
+        0.35
+    };
     clamp01(hit_overlap * 0.45 + broad_weight + hierarchy_bonus)
 }
 
@@ -3920,7 +4462,10 @@ fn compute_faithfulness_score(
         "fail" => 0.25,
         _ => 0.75,
     };
-    let penalty = unsupported as f64 * 0.12 + relationship as f64 * 0.14 + scope as f64 * 0.14 + polarity as f64 * 0.14;
+    let penalty = unsupported as f64 * 0.12
+        + relationship as f64 * 0.14
+        + scope as f64 * 0.14
+        + polarity as f64 * 0.14;
     clamp01(base - penalty)
 }
 
@@ -3931,7 +4476,10 @@ fn compute_answer_relevance(question: &str, profile: &QuestionProfile, answer: &
     if terms.is_empty() {
         return if answer.trim().is_empty() { 0.0 } else { 1.0 };
     }
-    let matched = terms.iter().filter(|term| answer.contains(term.as_str())).count();
+    let matched = terms
+        .iter()
+        .filter(|term| answer.contains(term.as_str()))
+        .count();
     clamp01(ratio(matched, terms.len()) * 0.8 + if answer.trim().is_empty() { 0.0 } else { 0.2 })
 }
 
@@ -3966,7 +4514,8 @@ fn load_settings(conn: &Connection) -> Result<Settings, String> {
         settings.max_context_chars = value.parse().unwrap_or(settings.max_context_chars);
     }
     if let Some(value) = get_setting(conn, "comprehensive_batch_chars")? {
-        settings.comprehensive_batch_chars = value.parse().unwrap_or(settings.comprehensive_batch_chars);
+        settings.comprehensive_batch_chars =
+            value.parse().unwrap_or(settings.comprehensive_batch_chars);
     }
     apply_simple_defaults(&mut settings);
     let (api_key, api_key_storage) = load_api_key(conn);
@@ -3986,9 +4535,11 @@ fn apply_simple_defaults(settings: &mut Settings) {
 }
 
 fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
-    conn.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |row| {
-        row.get::<_, String>(0)
-    })
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
     .optional()
     .map_err(|e| e.to_string())
 }
@@ -4039,14 +4590,19 @@ fn load_documents(conn: &Connection) -> Result<Vec<DocumentInfo>, String> {
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 fn load_stats(conn: &Connection) -> Result<AppStats, String> {
     let document_count = scalar_i64(conn, "SELECT COUNT(*) FROM documents")?;
-    let selected_document_count = scalar_i64(conn, "SELECT COUNT(*) FROM documents WHERE selected = 1")?;
+    let selected_document_count =
+        scalar_i64(conn, "SELECT COUNT(*) FROM documents WHERE selected = 1")?;
     let total_chars = scalar_i64(conn, "SELECT COALESCE(SUM(char_count), 0) FROM documents")?;
-    let selected_chars = scalar_i64(conn, "SELECT COALESCE(SUM(char_count), 0) FROM documents WHERE selected = 1")?;
+    let selected_chars = scalar_i64(
+        conn,
+        "SELECT COALESCE(SUM(char_count), 0) FROM documents WHERE selected = 1",
+    )?;
     let chunk_count = scalar_i64(conn, "SELECT COUNT(*) FROM chunks")?;
     let embedding_count = scalar_i64(conn, "SELECT COUNT(*) FROM chunk_embeddings")?;
     Ok(AppStats {
@@ -4275,7 +4831,8 @@ fn embedding_for_text(text: &str) -> Vec<f32> {
     let mut vector = vec![0f32; EMBEDDING_DIMS];
     for (term, weight) in term_weights(text) {
         let digest = Sha256::digest(term.as_bytes());
-        let index = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) as usize % EMBEDDING_DIMS;
+        let index = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) as usize
+            % EMBEDDING_DIMS;
         let sign = if digest[4] & 1 == 0 { 1.0 } else { -1.0 };
         vector[index] += sign * weight as f32;
     }
@@ -4320,7 +4877,11 @@ fn exact_bonus(query: &str, terms: &[String], text: &str) -> f64 {
     }
     for term in terms.iter().take(30) {
         if term.chars().count() >= 2 && text.contains(term) {
-            bonus += if term.chars().count() >= 4 { 0.045 } else { 0.02 };
+            bonus += if term.chars().count() >= 4 {
+                0.045
+            } else {
+                0.02
+            };
         }
     }
     bonus.min(0.45)
@@ -4378,8 +4939,12 @@ mod tests {
         let text = "第1章 総則\n（目的）\nこの規程は目的を定める。\n\n第2条 扶養手当\n扶養手当は条件を満たす職員に支給する。\n";
         let chunks = split_text_into_chunks(text);
         assert!(!chunks.is_empty());
-        assert!(chunks.iter().any(|chunk| chunk.heading_path.contains("第2条 扶養手当")));
-        assert!(chunks.iter().any(|chunk| chunk.content.contains("扶養手当")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.heading_path.contains("第2条 扶養手当")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.content.contains("扶養手当")));
     }
 
     #[test]
@@ -4448,7 +5013,10 @@ mod tests {
         conn.execute("DELETE FROM document_contexts", []).unwrap();
         backfill_missing_hierarchy_contexts(&conn).unwrap();
         assert!(scalar_i64(&conn, "SELECT COUNT(*) FROM section_contexts").unwrap() >= 2);
-        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM document_contexts").unwrap(), 1);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM document_contexts").unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -4536,7 +5104,8 @@ mod tests {
             heading_path: "第1章 給与".to_string(),
             char_start: 0,
             char_end: 80,
-            content: "住宅手当は借家に居住する職員に支給する。住宅手当の額は別表で定める。".to_string(),
+            content: "住宅手当は借家に居住する職員に支給する。住宅手当の額は別表で定める。"
+                .to_string(),
             prev_chunk_id: None,
             next_chunk_id: None,
         }];
@@ -4561,7 +5130,8 @@ mod tests {
 
     #[test]
     fn fact_statement_can_be_rebuilt_from_structured_fields() {
-        let statement = compose_fact_statement("職員", "扶養手当", "扶養親族を有する場合", "支給する", "");
+        let statement =
+            compose_fact_statement("職員", "扶養手当", "扶養親族を有する場合", "支給する", "");
         assert!(statement.contains("subject=職員"));
         assert!(statement.contains("object=扶養手当"));
         assert!(statement.contains("condition=扶養親族を有する場合"));
@@ -4655,8 +5225,7 @@ mod tests {
             quote: "支給する".to_string(),
             confidence: "high".to_string(),
         }];
-        let audit =
-            r#"{"verdict":"warning","unsupported_claims":["x"],"relationship_errors":[],"scope_errors":[],"polarity_errors":[]}"#;
+        let audit = r#"{"verdict":"warning","unsupported_claims":["x"],"relationship_errors":[],"scope_errors":[],"polarity_errors":[]}"#;
         let metrics = compute_evaluation_metrics(
             "手当はどうなっていますか",
             &profile,
