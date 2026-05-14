@@ -315,6 +315,38 @@ struct ChunkRecord {
     next_chunk_id: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+struct SectionContext {
+    document_id: i64,
+    file_name: String,
+    path: String,
+    heading_path: String,
+    char_start: i64,
+    char_end: i64,
+    chunk_ids: Vec<i64>,
+    concepts: Vec<String>,
+    summary_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct DocumentContext {
+    document_id: i64,
+    file_name: String,
+    path: String,
+    chunk_count: i64,
+    char_count: i64,
+    concepts: Vec<String>,
+    heading_index: Vec<String>,
+    summary_text: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct HierarchyContext {
+    sections: Vec<SectionContext>,
+    documents: Vec<DocumentContext>,
+    corpus_concepts: Vec<String>,
+}
+
 #[derive(Debug, Default, Clone)]
 struct ScoreParts {
     fts_rank: Option<usize>,
@@ -425,6 +457,28 @@ fn init_db(state: &AppStateInner) -> Result<(), String> {
             indexed_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS section_contexts (
+            id INTEGER PRIMARY KEY,
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            heading_path TEXT NOT NULL,
+            char_start INTEGER NOT NULL,
+            char_end INTEGER NOT NULL,
+            chunk_ids_json TEXT NOT NULL,
+            concepts_json TEXT NOT NULL,
+            summary_text TEXT NOT NULL,
+            indexed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS document_contexts (
+            document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+            chunk_count INTEGER NOT NULL,
+            char_count INTEGER NOT NULL,
+            concepts_json TEXT NOT NULL,
+            heading_index_json TEXT NOT NULL,
+            summary_text TEXT NOT NULL,
+            indexed_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS questions (
             id INTEGER PRIMARY KEY,
             text TEXT NOT NULL,
@@ -472,6 +526,7 @@ fn init_db(state: &AppStateInner) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_documents_selected ON documents(selected);
         CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id, ordinal);
+        CREATE INDEX IF NOT EXISTS idx_section_contexts_document ON section_contexts(document_id, heading_path);
         CREATE INDEX IF NOT EXISTS idx_chunk_ngrams_chunk ON chunk_ngrams(chunk_id);
         CREATE INDEX IF NOT EXISTS idx_extracted_facts_run ON extracted_facts(run_id);
         "#,
@@ -888,6 +943,10 @@ async fn answer_comprehensively(
         .map_err(|e| e.to_string())?;
         corrected
     };
+    let hierarchy = {
+        let conn = state.conn()?;
+        load_hierarchy_context(&conn, &request.selected_document_ids, &profile, &seed_hits)?
+    };
     let batches = build_chunk_batches(&chunks, settings.comprehensive_batch_chars);
     let total_batches = batches.len() as u64;
     let mut facts = Vec::new();
@@ -927,6 +986,7 @@ async fn answer_comprehensively(
             settings,
             &request.question,
             &profile,
+            &hierarchy,
             batch,
             run_id,
             cancel,
@@ -953,7 +1013,8 @@ async fn answer_comprehensively(
     );
 
     let reduced_facts = reduce_facts(app, settings, &request.question, &profile, &facts, run_id, cancel).await?;
-    let mut answer = synthesize_answer(app, settings, &request.question, &profile, &reduced_facts, run_id, cancel).await?;
+    let mut answer =
+        synthesize_answer(app, settings, &request.question, &profile, &hierarchy, &reduced_facts, run_id, cancel).await?;
     let mut audit = audit_facts_answer(app, settings, &request.question, &answer, &reduced_facts, run_id, cancel).await.ok();
 
     if let Some(audit_text) = audit.clone() {
@@ -1136,6 +1197,10 @@ fn index_one_file(conn: &mut Connection, path: &Path) -> Result<FileIndexOutcome
     }
     tx.execute("DELETE FROM chunks WHERE document_id = ?1", params![doc_id])
         .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM section_contexts WHERE document_id = ?1", params![doc_id])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM document_contexts WHERE document_id = ?1", params![doc_id])
+        .map_err(|e| e.to_string())?;
 
     let chunks = split_text_into_chunks(&text);
     let indexed_at = Utc::now().to_rfc3339();
@@ -1202,6 +1267,8 @@ fn index_one_file(conn: &mut Connection, path: &Path) -> Result<FileIndexOutcome
         .map_err(|e| e.to_string())?;
     }
 
+    rebuild_hierarchy_contexts(&tx, doc_id, &file_name, &path_string, char_count, &chunks, &inserted_ids, &indexed_at)?;
+
     tx.execute(
         "UPDATE documents SET status = 'indexed', indexed_at = ?1, error = NULL WHERE id = ?2",
         params![Utc::now().to_rfc3339(), doc_id],
@@ -1210,6 +1277,167 @@ fn index_one_file(conn: &mut Connection, path: &Path) -> Result<FileIndexOutcome
     tx.commit().map_err(|e| e.to_string())?;
 
     Ok(FileIndexOutcome::Indexed(chunks.len()))
+}
+
+fn rebuild_hierarchy_contexts(
+    conn: &Connection,
+    document_id: i64,
+    file_name: &str,
+    path: &str,
+    char_count: i64,
+    chunks: &[ChunkDraft],
+    chunk_ids: &[i64],
+    indexed_at: &str,
+) -> Result<(), String> {
+    let mut heading_order = Vec::new();
+    let mut section_indexes: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let heading = if chunk.heading_path.trim().is_empty() {
+            "(見出しなし)".to_string()
+        } else {
+            chunk.heading_path.clone()
+        };
+        if !section_indexes.contains_key(&heading) {
+            heading_order.push(heading.clone());
+        }
+        section_indexes.entry(heading).or_default().push(idx);
+    }
+
+    for heading in &heading_order {
+        let Some(indexes) = section_indexes.get(heading) else {
+            continue;
+        };
+        let section_chunks = indexes
+            .iter()
+            .filter_map(|idx| chunks.get(*idx).map(|chunk| (*idx, chunk)))
+            .collect::<Vec<_>>();
+        let section_chunk_ids = section_chunks
+            .iter()
+            .filter_map(|(idx, _)| chunk_ids.get(*idx).copied())
+            .collect::<Vec<_>>();
+        let char_start = section_chunks
+            .iter()
+            .map(|(_, chunk)| chunk.char_start)
+            .min()
+            .unwrap_or_default();
+        let char_end = section_chunks
+            .iter()
+            .map(|(_, chunk)| chunk.char_end)
+            .max()
+            .unwrap_or_default();
+        let section_texts = section_chunks
+            .iter()
+            .map(|(_, chunk)| (chunk.heading_path.as_str(), chunk.content.as_str()))
+            .collect::<Vec<_>>();
+        let concepts = top_concepts_from_texts(&section_texts, 40);
+        let sample = section_chunks
+            .first()
+            .map(|(_, chunk)| first_chars(&chunk.content, 260))
+            .unwrap_or_default();
+        let summary_text = format!(
+            "section={} chars={}-{} chunks={} concepts={} sample={}",
+            heading,
+            char_start,
+            char_end,
+            section_chunk_ids.len(),
+            concepts.join(", "),
+            sample
+        );
+        conn.execute(
+            r#"
+            INSERT INTO section_contexts(document_id, heading_path, char_start, char_end, chunk_ids_json, concepts_json, summary_text, indexed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                document_id,
+                heading,
+                char_start,
+                char_end,
+                serde_json::to_string(&section_chunk_ids).unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(&concepts).unwrap_or_else(|_| "[]".to_string()),
+                summary_text,
+                indexed_at
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let document_texts = chunks
+        .iter()
+        .map(|chunk| (chunk.heading_path.as_str(), chunk.content.as_str()))
+        .collect::<Vec<_>>();
+    let concepts = top_concepts_from_texts(&document_texts, 80);
+    let mut heading_index = chunks
+        .iter()
+        .map(|chunk| chunk.heading_path.clone())
+        .filter(|heading| !heading.trim().is_empty())
+        .collect::<Vec<_>>();
+    normalize_string_list(&mut heading_index);
+    heading_index.truncate(120);
+    let summary_text = format!(
+        "document={} chars={} chunks={} concepts={} headings={}",
+        file_name,
+        char_count,
+        chunks.len(),
+        concepts.join(", "),
+        heading_index.iter().take(30).cloned().collect::<Vec<_>>().join(" / ")
+    );
+    conn.execute(
+        r#"
+        INSERT INTO document_contexts(document_id, chunk_count, char_count, concepts_json, heading_index_json, summary_text, indexed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+        params![
+            document_id,
+            chunks.len() as i64,
+            char_count,
+            serde_json::to_string(&concepts).unwrap_or_else(|_| "[]".to_string()),
+            serde_json::to_string(&heading_index).unwrap_or_else(|_| "[]".to_string()),
+            summary_text,
+            indexed_at
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let _ = path;
+    Ok(())
+}
+
+fn top_concepts_from_texts(texts: &[(&str, &str)], limit: usize) -> Vec<String> {
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    for (heading, text) in texts {
+        for concept in concepts_from_heading(heading) {
+            if !is_generic_concept(&concept) {
+                *scores.entry(concept).or_insert(0.0) += 3.0;
+            }
+        }
+        for (concept, count) in content_concept_counts(text) {
+            if !is_generic_concept(&concept) {
+                *scores.entry(concept).or_insert(0.0) += count as f64;
+            }
+        }
+    }
+    let mut ranked = scores.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut out = ranked
+        .into_iter()
+        .map(|(concept, _)| concept)
+        .take(limit)
+        .collect::<Vec<_>>();
+    normalize_string_list(&mut out);
+    out
+}
+
+fn first_chars(text: &str, max_chars: usize) -> String {
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out.replace('\n', " ")
 }
 
 fn split_text_into_chunks(text: &str) -> Vec<ChunkDraft> {
@@ -1772,6 +2000,266 @@ fn load_selected_chunks(conn: &Connection, requested_doc_ids: &[i64]) -> Result<
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+fn load_hierarchy_context(
+    conn: &Connection,
+    requested_doc_ids: &[i64],
+    profile: &QuestionProfile,
+    hits: &[SearchHit],
+) -> Result<HierarchyContext, String> {
+    let doc_ids = selected_document_ids(conn, requested_doc_ids)?;
+    if doc_ids.is_empty() {
+        return Ok(HierarchyContext::default());
+    }
+    let placeholders = placeholders(doc_ids.len());
+    let values: Vec<Value> = doc_ids.iter().map(|id| Value::Integer(*id)).collect();
+
+    let document_sql = format!(
+        r#"
+        SELECT dc.document_id, d.file_name, d.path, dc.chunk_count, dc.char_count,
+               dc.concepts_json, dc.heading_index_json, dc.summary_text
+        FROM document_contexts dc
+        JOIN documents d ON d.id = dc.document_id
+        WHERE dc.document_id IN ({})
+        ORDER BY d.file_name
+        "#,
+        placeholders
+    );
+    let mut stmt = conn.prepare(&document_sql).map_err(|e| e.to_string())?;
+    let document_rows = stmt
+        .query_map(params_from_iter(values.clone()), |row| {
+            Ok(DocumentContext {
+                document_id: row.get(0)?,
+                file_name: row.get(1)?,
+                path: row.get(2)?,
+                chunk_count: row.get(3)?,
+                char_count: row.get(4)?,
+                concepts: parse_json_string_vec(row.get::<_, String>(5)?.as_str()),
+                heading_index: parse_json_string_vec(row.get::<_, String>(6)?.as_str()),
+                summary_text: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let documents = document_rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let section_sql = format!(
+        r#"
+        SELECT sc.document_id, d.file_name, d.path, sc.heading_path, sc.char_start, sc.char_end,
+               sc.chunk_ids_json, sc.concepts_json, sc.summary_text
+        FROM section_contexts sc
+        JOIN documents d ON d.id = sc.document_id
+        WHERE sc.document_id IN ({})
+        ORDER BY d.file_name, sc.char_start
+        "#,
+        placeholders
+    );
+    let mut stmt = conn.prepare(&section_sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params_from_iter(values), |row| {
+            Ok(SectionContext {
+                document_id: row.get(0)?,
+                file_name: row.get(1)?,
+                path: row.get(2)?,
+                heading_path: row.get(3)?,
+                char_start: row.get(4)?,
+                char_end: row.get(5)?,
+                chunk_ids: parse_json_i64_vec(row.get::<_, String>(6)?.as_str()),
+                concepts: parse_json_string_vec(row.get::<_, String>(7)?.as_str()),
+                summary_text: row.get(8)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut sections = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    sections = filter_hierarchy_sections(sections, profile, hits);
+
+    let mut corpus_concepts = Vec::new();
+    corpus_concepts.extend(profile.lower_concepts.clone());
+    for doc in &documents {
+        corpus_concepts.extend(doc.concepts.iter().take(30).cloned());
+    }
+    for section in &sections {
+        corpus_concepts.extend(section.concepts.iter().take(12).cloned());
+    }
+    normalize_string_list(&mut corpus_concepts);
+    corpus_concepts.truncate(120);
+
+    Ok(HierarchyContext {
+        sections,
+        documents,
+        corpus_concepts,
+    })
+}
+
+fn filter_hierarchy_sections(
+    mut sections: Vec<SectionContext>,
+    profile: &QuestionProfile,
+    hits: &[SearchHit],
+) -> Vec<SectionContext> {
+    let hit_chunks = hits.iter().map(|hit| hit.chunk_id).collect::<HashSet<_>>();
+    let terms = profile.search_terms();
+    for section in sections.iter_mut() {
+        let mut score = 0.0;
+        if section.chunk_ids.iter().any(|id| hit_chunks.contains(id)) {
+            score += 8.0;
+        }
+        if terms.iter().any(|term| section.heading_path.contains(term)) {
+            score += 4.0;
+        }
+        if section
+            .concepts
+            .iter()
+            .any(|concept| terms.iter().any(|term| concept.contains(term) || term.contains(concept)))
+        {
+            score += 4.0;
+        }
+        if profile.is_broad {
+            score += 1.0;
+        }
+        section.summary_text = format!("score={:.1} {}", score, section.summary_text);
+    }
+    sections.sort_by(|a, b| {
+        let score_a = context_score(&a.summary_text);
+        let score_b = context_score(&b.summary_text);
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.file_name.cmp(&b.file_name))
+            .then_with(|| a.char_start.cmp(&b.char_start))
+    });
+    sections.truncate(if profile.is_broad { 120 } else { 60 });
+    sections
+}
+
+fn context_score(summary: &str) -> f64 {
+    summary
+        .strip_prefix("score=")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or_default()
+}
+
+fn parse_json_string_vec(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+}
+
+fn parse_json_i64_vec(raw: &str) -> Vec<i64> {
+    serde_json::from_str::<Vec<i64>>(raw).unwrap_or_default()
+}
+
+fn build_batch_hierarchy_context(batch: &[ChunkRecord], hierarchy: &HierarchyContext) -> String {
+    if hierarchy.documents.is_empty() && hierarchy.sections.is_empty() {
+        return "階層文脈なし".to_string();
+    }
+    let batch_chunk_ids = batch.iter().map(|chunk| chunk.id).collect::<HashSet<_>>();
+    let batch_doc_ids = batch.iter().map(|chunk| chunk.document_id).collect::<HashSet<_>>();
+    let mut out = String::new();
+    if !hierarchy.corpus_concepts.is_empty() {
+        out.push_str(&format!(
+            "CORPUS concepts: {}\n",
+            hierarchy
+                .corpus_concepts
+                .iter()
+                .take(60)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out.push_str("DOCUMENT parents:\n");
+    for doc in hierarchy
+        .documents
+        .iter()
+        .filter(|doc| batch_doc_ids.contains(&doc.document_id))
+        .take(8)
+    {
+        out.push_str(&format!(
+            "- file={} path={} chunks={} chars={} concepts={} summary={}\n",
+            doc.file_name,
+            doc.path,
+            doc.chunk_count,
+            doc.char_count,
+            doc.concepts.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
+            doc.summary_text
+        ));
+    }
+    out.push_str("SECTION parents:\n");
+    let mut included = 0usize;
+    for section in &hierarchy.sections {
+        if !batch_doc_ids.contains(&section.document_id) {
+            continue;
+        }
+        let intersects = section.chunk_ids.iter().any(|id| batch_chunk_ids.contains(id));
+        let same_heading = batch
+            .iter()
+            .any(|chunk| chunk.document_id == section.document_id && chunk.heading_path == section.heading_path);
+        if !intersects && !same_heading {
+            continue;
+        }
+        out.push_str(&format!(
+            "- file={} path={} heading={} chars={}-{} concepts={} summary={}\n",
+            section.file_name,
+            section.path,
+            section.heading_path,
+            section.char_start,
+            section.char_end,
+            section.concepts.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
+            section.summary_text
+        ));
+        included += 1;
+        if included >= 12 {
+            break;
+        }
+    }
+    out
+}
+
+fn build_answer_hierarchy_context(hierarchy: &HierarchyContext, profile: &QuestionProfile) -> String {
+    if hierarchy.documents.is_empty() && hierarchy.sections.is_empty() {
+        return "階層文脈なし".to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "CORPUS concepts: {}\n",
+        hierarchy
+            .corpus_concepts
+            .iter()
+            .take(80)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    out.push_str("DOCUMENT summaries:\n");
+    for doc in hierarchy.documents.iter().take(20) {
+        out.push_str(&format!(
+            "- file={} path={} chunks={} chars={} concepts={} headings={} summary={}\n",
+            doc.file_name,
+            doc.path,
+            doc.chunk_count,
+            doc.char_count,
+            doc.concepts.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
+            doc.heading_index.iter().take(12).cloned().collect::<Vec<_>>().join(" / "),
+            doc.summary_text
+        ));
+    }
+    if profile.is_broad {
+        out.push_str("RELEVANT section summaries:\n");
+        for section in hierarchy.sections.iter().take(60) {
+            out.push_str(&format!(
+                "- file={} path={} heading={} concepts={} summary={}\n",
+                section.file_name,
+                section.path,
+                section.heading_path,
+                section.concepts.iter().take(16).cloned().collect::<Vec<_>>().join(", "),
+                section.summary_text
+            ));
+        }
+    }
+    out
+}
+
 fn build_chunk_batches(chunks: &[ChunkRecord], max_chars: usize) -> Vec<Vec<ChunkRecord>> {
     let mut batches = Vec::new();
     let mut current = Vec::new();
@@ -2203,6 +2691,7 @@ async fn extract_facts_from_batch(
     settings: &Settings,
     question: &str,
     profile: &QuestionProfile,
+    hierarchy: &HierarchyContext,
     batch: &[ChunkRecord],
     run_id: &str,
     cancel: &Arc<AtomicBool>,
@@ -2220,6 +2709,7 @@ async fn extract_facts_from_batch(
     } else {
         profile.lower_concepts.iter().take(80).cloned().collect::<Vec<_>>().join(", ")
     };
+    let hierarchy_context = build_batch_hierarchy_context(batch, hierarchy);
     let messages = vec![
         json!({
             "role": "system",
@@ -2228,11 +2718,12 @@ async fn extract_facts_from_batch(
         json!({
             "role": "user",
             "content": format!(
-                "質問:\n{}\n\n広い質問か:\n{}\n\n検索観点:\n{}\n\nsource由来の下位概念候補:\n{}\n\n抽出ルール:\n- source外の一般知識は使わない\n- condition がある effect は、必ず condition と結び付けて抽出する\n- subject/object/scope を広げない\n- 否定、対象外、ただし書きは polarity または exception に残す\n- 質問範囲外の不足情報は抽出しない\n\nSOURCE:\n{}",
+                "質問:\n{}\n\n広い質問か:\n{}\n\n検索観点:\n{}\n\nsource由来の下位概念候補:\n{}\n\n抽出ルール:\n- source外の一般知識は使わない\n- condition がある effect は、必ず condition と結び付けて抽出する\n- subject/object/scope を広げない\n- 否定、対象外、ただし書きは polarity または exception に残す\n- PARENT_CONTEXT はSOURCEチャンクの親セクション・文書・全体文脈です。条件や例外を切り落とさないために使ってよいが、quote はSOURCE内から取る\n- 質問範囲外の不足情報は抽出しない\n\nPARENT_CONTEXT:\n{}\n\nSOURCE:\n{}",
                 question,
                 profile.is_broad,
                 profile_terms.join(", "),
                 lower_concepts,
+                hierarchy_context,
                 source
             )
         }),
@@ -2428,6 +2919,7 @@ async fn synthesize_answer(
     settings: &Settings,
     question: &str,
     profile: &QuestionProfile,
+    hierarchy: &HierarchyContext,
     facts: &[ExtractedFact],
     run_id: &str,
     cancel: &Arc<AtomicBool>,
@@ -2444,6 +2936,7 @@ async fn synthesize_answer(
     } else {
         profile.lower_concepts.iter().take(80).cloned().collect::<Vec<_>>().join(", ")
     };
+    let hierarchy_context = build_answer_hierarchy_context(hierarchy, profile);
     let messages = vec![
         json!({
             "role": "system",
@@ -2452,10 +2945,11 @@ async fn synthesize_answer(
         json!({
             "role": "user",
             "content": format!(
-                "質問:\n{}\n\n広い質問か:\n{}\n\nsource由来の下位概念候補:\n{}\n\nFACTS:\n{}\n\n回答要件:\n- 冒頭で質問への直接回答を書く\n- 「はい/いいえ」「対象/対象外」「できる/できない」「こう扱う」など判断できる質問では、まず判断を示す\n- 判断に条件がある場合は、条件付きの結論として書く\n- 広い質問では、source由来の下位概念候補とFACTSに基づいて、関係する下位概念ごとに整理する\n- その後に理由、条件、例外、対象者、金額、期間、手続きを整理する\n- 文書間差分や矛盾があれば明示する\n- FACTSにない推測は禁止\n- subject を別の主体に置き換えない\n- object を別の制度・手当・行為に置き換えない\n- condition のない effect として断定しない\n- effect を反転させない\n- scope を広げない\n- 根拠不足は、質問へ直接答えるために必要な点だけに絞る\n- 日本語で、Markdownとして読みやすく回答する",
+                "質問:\n{}\n\n広い質問か:\n{}\n\nsource由来の下位概念候補:\n{}\n\nHIERARCHY_CONTEXT:\n{}\n\nFACTS:\n{}\n\n回答要件:\n- 冒頭で質問への直接回答を書く\n- 「はい/いいえ」「対象/対象外」「できる/できない」「こう扱う」など判断できる質問では、まず判断を示す\n- 判断に条件がある場合は、条件付きの結論として書く\n- 広い質問では、source由来の下位概念候補とFACTSに基づいて、関係する下位概念ごとに整理する\n- HIERARCHY_CONTEXTは網羅性確認と章・文書範囲確認に使う。ただし、主要主張の根拠はFACTSに限定する\n- その後に理由、条件、例外、対象者、金額、期間、手続きを整理する\n- 文書間差分や矛盾があれば明示する\n- FACTSにない推測は禁止\n- subject を別の主体に置き換えない\n- object を別の制度・手当・行為に置き換えない\n- condition のない effect として断定しない\n- effect を反転させない\n- scope を広げない\n- 根拠不足は、質問へ直接答えるために必要な点だけに絞る\n- 日本語で、Markdownとして読みやすく回答する",
                 question,
                 profile.is_broad,
                 lower_concepts,
+                hierarchy_context,
                 source
             )
         }),
@@ -3351,6 +3845,40 @@ mod tests {
         assert!(!response.hits.is_empty());
         assert!(response.hits[0].snippet.contains("扶養手当"));
         assert!(response.hits[0].ngram_score > 0.0 || response.hits[0].vector_score > 0.0);
+    }
+
+    #[test]
+    fn index_builds_hierarchy_contexts_for_parent_recall() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("mini-lm-test.sqlite3");
+        let source_dir = temp.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let file_path = source_dir.join("rules.txt");
+        fs::write(
+            &file_path,
+            "第1章 給与\n第1条 扶養手当\n扶養手当は、扶養親族を有する職員に支給する。\n第2条 住宅手当\n住宅手当は借家に居住する職員に支給する。\n",
+        )
+        .unwrap();
+
+        let state = AppStateInner::new(db_path);
+        init_db(&state).unwrap();
+        let mut conn = state.conn().unwrap();
+        index_one_file(&mut conn, &file_path).unwrap();
+
+        let section_count = scalar_i64(&conn, "SELECT COUNT(*) FROM section_contexts").unwrap();
+        let document_count = scalar_i64(&conn, "SELECT COUNT(*) FROM document_contexts").unwrap();
+        assert!(section_count >= 2);
+        assert_eq!(document_count, 1);
+
+        let chunks = load_selected_chunks(&conn, &[]).unwrap();
+        let mut profile = QuestionProfile::from_question("手当はどうなっていますか");
+        enrich_profile_with_source_concepts(&mut profile, &chunks, "手当はどうなっていますか");
+        let hierarchy = load_hierarchy_context(&conn, &[], &profile, &[]).unwrap();
+        let context = build_batch_hierarchy_context(&chunks[..1], &hierarchy);
+
+        assert!(context.contains("DOCUMENT parents"));
+        assert!(context.contains("SECTION parents"));
+        assert!(context.contains("扶養手当") || context.contains("住宅手当"));
     }
 
     #[test]
