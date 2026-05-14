@@ -67,39 +67,19 @@ button.primary {
   color: #ffffff;
 }
 
-.icon-stop {
-  width: 12px;
-  height: 12px;
-  border-radius: 2px;
-  background: currentColor;
+.action-icon {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
-.icon-send {
-  position: relative;
-  width: 17px;
-  height: 17px;
-  transform: rotate(45deg);
-}
-
-.icon-send::before,
-.icon-send::after {
-  content: "";
-  position: absolute;
-  background: currentColor;
-}
-
-.icon-send::before {
-  inset: 7px 0 7px 0;
-}
-
-.icon-send::after {
-  right: 0;
-  top: 0;
-  width: 9px;
-  height: 9px;
-  border-top: 3px solid currentColor;
-  border-right: 3px solid currentColor;
-  background: transparent;
+.action-icon rect {
+  fill: currentColor;
+  stroke: none;
 }
 
 .toast-region {

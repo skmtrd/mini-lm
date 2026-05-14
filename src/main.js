@@ -60,10 +60,15 @@ document.querySelector("#app").innerHTML = `
         <div class="composer-actions">
           <button id="clearMessagesButton" type="button">履歴クリア</button>
           <button id="cancelButton" class="icon-button" type="button" disabled title="停止" aria-label="停止">
-            <span aria-hidden="true" class="icon-stop"></span>
+            <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+              <rect x="7" y="7" width="10" height="10" rx="1.5"></rect>
+            </svg>
           </button>
           <button id="sendButton" class="send-button" type="submit" title="送信" aria-label="送信">
-            <span aria-hidden="true" class="icon-send"></span>
+            <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M5 12h13"></path>
+              <path d="M12 5l7 7-7 7"></path>
+            </svg>
           </button>
         </div>
       </form>
