@@ -384,6 +384,12 @@ button.primary {
   overflow-wrap: anywhere;
 }
 
+.message.assistant .body.status-body {
+  border-color: transparent;
+  padding: 6px 0;
+  background: transparent;
+}
+
 .message.user .body {
   background: #e7f2f0;
   border-color: #b9dcd7;

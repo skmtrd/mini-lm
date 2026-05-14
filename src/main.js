@@ -539,6 +539,7 @@ function renderAssistantStatus(title, payload = {}) {
   const shouldStick = shouldAutoScroll();
   const percent = payload.total ? Math.min(100, Math.round((payload.completed / payload.total) * 100)) : 0;
   const stageClass = payload.stage ? `stage-${payload.stage}` : "stage-idle";
+  state.currentAssistantBody.classList.add("status-body");
   state.currentAssistantBody.innerHTML = `
     <div class="thinking ${stageClass}">
       <span class="thinking-dot"></span>
@@ -619,6 +620,7 @@ function updateMessage(id, patch) {
 }
 
 function renderMarkdown(element, source) {
+  element.classList.remove("status-body");
   element.classList.add("markdown-body");
   element.innerHTML = DOMPurify.sanitize(marked.parse(source || ""));
 }
