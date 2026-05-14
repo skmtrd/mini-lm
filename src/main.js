@@ -17,10 +17,12 @@ const state = {
   currentAssistantBody: null,
   currentAssistantRaw: "",
   currentAssistantHasAnswer: false,
+  toastSeq: 0,
 };
 
 document.querySelector("#app").innerHTML = `
   <div class="shell">
+    <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="false"></div>
     <aside class="sidebar">
       <section class="source-panel">
         <div class="source-head">
@@ -55,8 +57,12 @@ document.querySelector("#app").innerHTML = `
         ></textarea>
         <div class="composer-actions">
           <button id="clearMessagesButton" type="button">履歴クリア</button>
-          <button id="cancelButton" type="button" disabled>停止</button>
-          <button id="sendButton" class="primary" type="submit">送信</button>
+          <button id="cancelButton" class="icon-button" type="button" disabled title="停止" aria-label="停止">
+            <span aria-hidden="true" class="icon-stop"></span>
+          </button>
+          <button id="sendButton" class="send-button" type="submit" title="送信" aria-label="送信">
+            <span aria-hidden="true" class="icon-send"></span>
+          </button>
         </div>
       </form>
     </main>
@@ -79,6 +85,7 @@ const els = {
   questionInput: $("#questionInput"),
   clearMessagesButton: $("#clearMessagesButton"),
   sendButton: $("#sendButton"),
+  toastRegion: $("#toastRegion"),
 };
 
 init();
@@ -115,8 +122,8 @@ function wireEvents() {
     renderAssistantStatus("停止しています", "現在の処理へキャンセル要求を送りました。");
   });
   els.clearMessagesButton.addEventListener("click", () => {
-    els.messages.innerHTML = "";
-    addMessage("assistant", "履歴をクリアしました。", { markdown: true });
+    clearMessages();
+    showToast("履歴をクリアしました", "チャット欄を空にしました。", "info");
   });
   els.questionForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -193,21 +200,23 @@ async function chooseSourceDirectory() {
 async function indexSource() {
   if (state.busy) return;
   setBusy(true);
-  const assistant = addMessage("assistant", "", { markdown: true });
-  state.currentAssistantBody = assistant.querySelector(".body");
+  state.currentAssistantBody = null;
   state.currentAssistantRaw = "";
   state.currentAssistantHasAnswer = false;
 
   try {
-    renderAssistantStatus("資料を読み込んでいます", "ファイルの変更を確認し、検索インデックスを更新しています。");
+    showToast("資料を更新しています", "ファイルの変更を確認しています。", "running", { persist: true });
     const summary = await invoke("index_source_directory");
     await refreshSnapshot();
-    renderMarkdown(
-      state.currentAssistantBody,
-      `資料の更新が完了しました。\n\n- 読み込み: ${summary.indexedFiles}件\n- 変更なし: ${summary.skippedFiles}件\n- 失敗: ${summary.failedFiles}件`,
+    clearPersistentToasts();
+    showToast(
+      "資料の更新が完了しました",
+      `読み込み ${summary.indexedFiles}件 / 変更なし ${summary.skippedFiles}件 / 失敗 ${summary.failedFiles}件`,
+      summary.failedFiles ? "warn" : "success",
     );
   } catch (error) {
-    renderMarkdown(state.currentAssistantBody, `資料の更新に失敗しました。\n\n理由: ${String(error)}`);
+    clearPersistentToasts();
+    showToast("資料の更新に失敗しました", String(error), "error");
   } finally {
     state.currentAssistantBody = null;
     state.currentRunId = null;
@@ -259,6 +268,17 @@ function selectedDocumentIds() {
   return (state.snapshot?.documents || []).filter((doc) => doc.selected).map((doc) => doc.id);
 }
 
+function clearMessages() {
+  els.messages.innerHTML = `
+    <article class="message assistant">
+      <div class="body markdown-body">
+        <p>資料を選択してインデックスを作成すると、選択中の資料だけを根拠に回答します。</p>
+      </div>
+    </article>
+  `;
+  scrollMessages({ force: true });
+}
+
 function renderProgress(payload) {
   if (payload.runId) state.currentRunId = payload.runId;
   if (!state.currentAssistantBody || state.currentAssistantHasAnswer) return;
@@ -298,6 +318,39 @@ function renderAssistantStatus(title, detail) {
     </div>
   `;
   scrollMessages();
+}
+
+function showToast(title, detail = "", tone = "info", options = {}) {
+  const id = `toast-${++state.toastSeq}`;
+  const toast = document.createElement("div");
+  toast.className = `toast ${tone}`;
+  toast.dataset.toastId = id;
+  if (options.persist) toast.dataset.persist = "true";
+  toast.innerHTML = `
+    <div class="toast-mark" aria-hidden="true"></div>
+    <div class="toast-copy">
+      <strong>${escapeHtml(title)}</strong>
+      ${detail ? `<p>${escapeHtml(detail)}</p>` : ""}
+    </div>
+    <button class="toast-close" type="button" aria-label="閉じる" title="閉じる">×</button>
+  `;
+  toast.querySelector(".toast-close").addEventListener("click", () => dismissToast(toast));
+  els.toastRegion.append(toast);
+  requestAnimationFrame(() => toast.classList.add("visible"));
+  if (!options.persist) {
+    window.setTimeout(() => dismissToast(toast), options.duration ?? 4200);
+  }
+  return id;
+}
+
+function dismissToast(toast) {
+  if (!toast || !toast.isConnected) return;
+  toast.classList.remove("visible");
+  window.setTimeout(() => toast.remove(), 180);
+}
+
+function clearPersistentToasts() {
+  els.toastRegion.querySelectorAll("[data-persist='true']").forEach(dismissToast);
 }
 
 function addMessage(role, text, options = {}) {

@@ -48,6 +48,140 @@ button.primary {
   color: #ffffff;
 }
 
+.icon-button,
+.send-button {
+  display: inline-grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+}
+
+.icon-button {
+  background: #ffffff;
+}
+
+.send-button {
+  border-color: #126b61;
+  background: #126b61;
+  color: #ffffff;
+}
+
+.icon-stop {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+.icon-send {
+  position: relative;
+  width: 17px;
+  height: 17px;
+  transform: rotate(45deg);
+}
+
+.icon-send::before,
+.icon-send::after {
+  content: "";
+  position: absolute;
+  background: currentColor;
+}
+
+.icon-send::before {
+  inset: 7px 0 7px 0;
+}
+
+.icon-send::after {
+  right: 0;
+  top: 0;
+  width: 9px;
+  height: 9px;
+  border-top: 3px solid currentColor;
+  border-right: 3px solid currentColor;
+  background: transparent;
+}
+
+.toast-region {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  z-index: 20;
+  display: grid;
+  width: min(520px, calc(100vw - 28px));
+  gap: 8px;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.toast {
+  display: grid;
+  grid-template-columns: 10px 1fr auto;
+  gap: 10px;
+  align-items: start;
+  border: 1px solid #d8e0e6;
+  border-radius: 8px;
+  padding: 10px 10px 10px 12px;
+  background: #ffffff;
+  box-shadow: 0 12px 28px rgb(31 37 43 / 16%);
+  opacity: 0;
+  pointer-events: auto;
+  transform: translateY(-8px);
+  transition:
+    opacity 160ms ease,
+    transform 160ms ease;
+}
+
+.toast.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.toast-mark {
+  width: 8px;
+  height: 8px;
+  margin-top: 7px;
+  border-radius: 50%;
+  background: #61707c;
+}
+
+.toast.success .toast-mark {
+  background: #126b61;
+}
+
+.toast.warn .toast-mark {
+  background: #a36a00;
+}
+
+.toast.error .toast-mark {
+  background: #b42318;
+}
+
+.toast.running .toast-mark {
+  background: #126b61;
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+.toast-copy strong {
+  display: block;
+  font-size: 13px;
+}
+
+.toast-copy p {
+  margin: 2px 0 0;
+  color: #667582;
+  font-size: 12px;
+}
+
+.toast-close {
+  width: 24px;
+  height: 24px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #667582;
+}
+
 .shell {
   display: grid;
   grid-template-columns: 320px minmax(0, 1fr);
