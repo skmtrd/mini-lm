@@ -876,6 +876,18 @@ async fn answer_comprehensively(
         load_selected_chunks(&conn, &request.selected_document_ids)?
     };
     enrich_profile_with_source_concepts(&mut profile, &chunks, &request.question);
+    let seed_hits = {
+        let conn = state.conn()?;
+        let corrected =
+            corrective_retrieval_internal(&conn, &request.question, &request.selected_document_ids, &profile, seed_hits)?;
+        let hits_json = serde_json::to_string(&corrected).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "UPDATE retrieval_runs SET hits_json = ?1 WHERE id = ?2",
+            params![hits_json, run_id],
+        )
+        .map_err(|e| e.to_string())?;
+        corrected
+    };
     let batches = build_chunk_batches(&chunks, settings.comprehensive_batch_chars);
     let total_batches = batches.len() as u64;
     let mut facts = Vec::new();
@@ -1780,6 +1792,60 @@ fn build_chunk_batches(chunks: &[ChunkRecord], max_chars: usize) -> Vec<Vec<Chun
     batches
 }
 
+fn corrective_retrieval_internal(
+    conn: &Connection,
+    question: &str,
+    selected_document_ids: &[i64],
+    profile: &QuestionProfile,
+    seed_hits: Vec<SearchHit>,
+) -> Result<Vec<SearchHit>, String> {
+    let max_seed_score = seed_hits
+        .iter()
+        .map(|hit| hit.score)
+        .fold(0.0_f64, |a, b| a.max(b));
+    let should_expand = profile.is_broad || seed_hits.is_empty() || max_seed_score < 0.08;
+    if !should_expand {
+        return Ok(seed_hits);
+    }
+
+    let mut queries = Vec::new();
+    queries.push(question.trim().to_string());
+    queries.extend(profile.lower_concepts.iter().take(30).cloned());
+    queries.extend(profile.aspects.iter().take(12).cloned());
+    if profile.terms.len() > 1 {
+        queries.push(profile.terms.iter().take(8).cloned().collect::<Vec<_>>().join(" "));
+    }
+    normalize_string_list(&mut queries);
+
+    let mut merged: HashMap<i64, SearchHit> = seed_hits
+        .into_iter()
+        .map(|hit| (hit.chunk_id, hit))
+        .collect();
+    for query in queries.into_iter().take(36) {
+        let response = hybrid_search_internal(conn, &query, selected_document_ids, 8)?;
+        for mut hit in response.hits {
+            hit.debug = format!("{} corrective_query={}", hit.debug, query);
+            match merged.get_mut(&hit.chunk_id) {
+                Some(existing) => {
+                    existing.score = existing.score.max(hit.score) + 0.015;
+                    if !existing.debug.contains("corrective_query=") {
+                        existing.debug = format!("{} corrective_query={}", existing.debug, query);
+                    }
+                }
+                None => {
+                    merged.insert(hit.chunk_id, hit);
+                }
+            }
+        }
+    }
+
+    let mut hits = merged.into_values().collect::<Vec<_>>();
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    diversify_hits(&mut hits, 32);
+    hits.truncate(32);
+    Ok(hits)
+}
+
 fn enrich_profile_with_source_concepts(profile: &mut QuestionProfile, chunks: &[ChunkRecord], question: &str) {
     let mut concepts = source_derived_concepts(chunks, question, &profile.terms);
     profile.lower_concepts.append(&mut concepts);
@@ -1807,6 +1873,19 @@ fn source_derived_concepts(chunks: &[ChunkRecord], question: &str, terms: &[Stri
             }
             *scores.entry(concept).or_insert(0.0) += score;
         }
+        for (concept, count) in content_concept_counts(&chunk.content) {
+            if is_generic_concept(&concept) {
+                continue;
+            }
+            let mut score = (count as f64).min(8.0) * 0.75;
+            if concept_matches_question(&concept, &question_terms) {
+                score += 8.0;
+            }
+            if heading_mentions_concept(&chunk.heading_path, &concept) {
+                score += 2.0;
+            }
+            *scores.entry(concept).or_insert(0.0) += score;
+        }
     }
 
     let broad = is_broad_question(question, terms);
@@ -1823,6 +1902,133 @@ fn source_derived_concepts(chunks: &[ChunkRecord], question: &str, terms: &[Stri
         .collect::<Vec<_>>();
     normalize_string_list(&mut out);
     out
+}
+
+fn content_concept_counts(text: &str) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for segment in split_japanese_segments(text) {
+        let chars: Vec<char> = segment.chars().collect();
+        if chars.len() < 2 {
+            continue;
+        }
+        for suffix in concept_suffixes() {
+            let suffix_chars: Vec<char> = suffix.chars().collect();
+            if suffix_chars.is_empty() || chars.len() < suffix_chars.len() {
+                continue;
+            }
+            for start_at in 0..=chars.len() - suffix_chars.len() {
+                if chars[start_at..start_at + suffix_chars.len()] != suffix_chars[..] {
+                    continue;
+                }
+                let end = start_at + suffix_chars.len();
+                let start = concept_start_index(&chars, start_at);
+                if start >= end {
+                    continue;
+                }
+                let concept: String = chars[start..end].iter().collect();
+                let concept = normalize_content_concept(&concept);
+                if is_valid_source_concept(&concept) {
+                    *counts.entry(concept).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+fn split_japanese_segments(text: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if is_japanese_word_char(ch) {
+            current.push(ch);
+        } else if !current.is_empty() {
+            segments.push(current.clone());
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn is_japanese_word_char(ch: char) -> bool {
+    let code = ch as u32;
+    (0x3040..=0x30ff).contains(&code)
+        || (0x3400..=0x9fff).contains(&code)
+        || (0xf900..=0xfaff).contains(&code)
+        || ch == '々'
+        || ch == 'ー'
+}
+
+fn concept_suffixes() -> &'static [&'static str] {
+    &[
+        "手当",
+        "休暇",
+        "休業",
+        "規程",
+        "規則",
+        "制度",
+        "給与",
+        "勤務",
+        "旅費",
+        "届出",
+        "申請",
+        "許可",
+        "承認",
+        "控除",
+        "賞与",
+        "退職",
+        "手続",
+        "補助",
+        "扶養",
+    ]
+}
+
+fn concept_start_index(chars: &[char], suffix_start: usize) -> usize {
+    let mut start = suffix_start.saturating_sub(10);
+    while start < suffix_start && is_concept_connector(chars[start]) {
+        start += 1;
+    }
+    for idx in (start..suffix_start).rev() {
+        if is_concept_boundary(chars[idx]) {
+            return idx + 1;
+        }
+    }
+    start
+}
+
+fn is_concept_connector(ch: char) -> bool {
+    matches!(ch, 'の' | 'に' | 'を' | 'は' | 'が' | 'と' | '及' | 'び' | '又')
+}
+
+fn is_concept_boundary(ch: char) -> bool {
+    matches!(
+        ch,
+        'の' | 'に' | 'を' | 'は' | 'が' | 'と' | '及' | 'び' | '又' | '者' | '時' | '合'
+    )
+}
+
+fn normalize_content_concept(raw: &str) -> String {
+    let article_re = Regex::new(r"^第[一二三四五六七八九十百千0-9０-９]+(章|節|款|目|条)").unwrap();
+    let mut text = article_re.replace(raw.trim(), "").trim().to_string();
+    for prefix in ["この", "その", "当該", "各", "別に定める"] {
+        text = text.trim_start_matches(prefix).to_string();
+    }
+    text
+}
+
+fn is_valid_source_concept(concept: &str) -> bool {
+    let len = concept.chars().count();
+    len >= 2
+        && len <= 18
+        && !is_stop_term(concept)
+        && !concept.chars().all(|ch| matches!(ch, '第' | '章' | '節' | '条' | '項'))
+}
+
+fn heading_mentions_concept(heading_path: &str, concept: &str) -> bool {
+    !concept.trim().is_empty() && heading_path.contains(concept)
 }
 
 fn concepts_from_heading(heading_path: &str) -> Vec<String> {
@@ -3220,6 +3426,26 @@ mod tests {
         assert!(profile.is_broad);
         assert!(profile.lower_concepts.contains(&"扶養手当".to_string()));
         assert!(profile.lower_concepts.contains(&"通勤手当".to_string()));
+    }
+
+    #[test]
+    fn broad_question_discovers_repeated_content_concepts_without_headings() {
+        let chunks = vec![ChunkRecord {
+            id: 1,
+            document_id: 1,
+            file_name: "rules.txt".to_string(),
+            path: "/tmp/rules.txt".to_string(),
+            heading_path: "第1章 給与".to_string(),
+            char_start: 0,
+            char_end: 80,
+            content: "住宅手当は借家に居住する職員に支給する。住宅手当の額は別表で定める。".to_string(),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+        }];
+        let mut profile = QuestionProfile::from_question("手当はどうなっていますか");
+        enrich_profile_with_source_concepts(&mut profile, &chunks, "手当はどうなっていますか");
+
+        assert!(profile.lower_concepts.contains(&"住宅手当".to_string()));
     }
 
     #[test]
