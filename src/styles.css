@@ -142,8 +142,8 @@ button.primary {
 .window-drag-region {
   position: fixed;
   top: 0;
-  right: 0;
-  left: 0;
+  right: 280px;
+  left: 320px;
   z-index: 9;
   height: var(--window-drag-height);
 }
@@ -161,7 +161,7 @@ button.primary {
 
 .history-sidebar {
   overflow: auto;
-  padding: calc(14px + var(--window-drag-height)) 14px 14px;
+  padding: 14px;
   border-left: 1px solid #d8e0e6;
   background: #f2f5f7;
 }
