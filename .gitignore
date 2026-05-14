@@ -1,12 +1,37 @@
+# Dependencies
 node_modules/
+
+# Build artifacts
 dist/
+target/
 src-tauri/target/
 src-tauri/gen/
+
+# Local source documents
+source/
+sources/
+local-source/
+local-sources/
+documents/
+data/
+local-data/
+
+# Local app data and databases
+*.sqlite
+*.sqlite-*
 *.sqlite3
 *.sqlite3-*
 *.db
-*.log
-.DS_Store
+*.db-*
+
+# Secrets and local environment
 .env
 .env.*
-target/
+*.key
+*.pem
+
+# Logs and OS/editor noise
+*.log
+.DS_Store
+.idea/
+.vscode/

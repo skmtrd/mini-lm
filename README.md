@@ -1,39 +1,71 @@
 # mini-lm Native
 
-Windows / macOS 両対応を目標にした、ローカルテキスト専用の NotebookLM 風デスクトップアプリです。
+ローカルのテキスト資料だけを根拠に回答する、NotebookLM 風のデスクトップアプリです。macOS / Windows 両対応を前提に、Tauri 2 + Rust + Vite で構成しています。
 
-`source` ディレクトリ内の大きなテキストをローカルでチャンク化し、SQLiteへ永続保存します。質問時は全文をDeepSeekへ丸投げせず、全文検索、n-gram検索、ローカルベクトル検索を統合して根拠候補を作り、選択された文書だけを根拠に回答します。
+大きなテキストをローカルで分割・索引化し、質問時は全文をそのまま LLM に投げず、全文検索、n-gram 検索、ローカルベクトル検索を組み合わせて根拠候補を作ります。回答は選択中の資料だけを根拠に生成します。
 
-## 現在の構成
+## 特徴
+
+- ローカルフォルダ内のテキスト資料を読み込み
+- ファイル単位で回答対象を選択
+- 高精度網羅モードで固定
+- DeepSeek Chat Completions API を使用
+- API キーは OS Keychain / Credential Manager に保存
+- SQLite + FTS5 + n-gram index + ローカル embedding で検索
+- チャット履歴、アクティブチャット、アーカイブ済みチャットを管理
+- macOS / Windows 向けネイティブアプリとしてビルド可能
+
+## 技術構成
 
 - UI: Vite + vanilla JavaScript
 - Native shell: Tauri 2
 - Backend: Rust
 - DB: SQLite + FTS5
-- Vector: ローカル日本語n-gram hash embedding
-- LLM: DeepSeek Chat Completions API
-- API key: OS Keychain / Credential Manager。保存できない環境ではSQLite平文フォールバックを明示して使う。
+- Vector: ローカル日本語 n-gram hash embedding
+- LLM: DeepSeek OpenAI-compatible Chat Completions API
+
+## 公開リポジトリでの注意
+
+このリポジトリは GitHub 公開を想定しています。次のものはコミットしないでください。
+
+- 実際に読み込ませる資料フォルダ
+- `source/`, `documents/`, `data/` などのローカル資料
+- `.env` などの環境変数ファイル
+- SQLite DB
+- API キー、トークン、秘密鍵
+- `node_modules/`, `dist/`, `src-tauri/target/`
+
+`.gitignore` でこれらは除外しています。資料はリポジトリ外、または ignored な `source/` などに置いて、アプリ内のフォルダ選択から指定してください。
+
+## セットアップ
+
+```bash
+npm install
+```
+
+Rust と Tauri のビルド環境も必要です。
 
 ## 開発実行
 
 ```bash
-npm install
 npm run tauri:dev
 ```
 
 ## ビルド
 
+macOS:
+
 ```bash
 npm run tauri:build
 ```
 
-macOSでは `.app` を作成します。WindowsではWindows環境で次を実行します。
+Windows:
 
 ```bash
 npm run tauri:build:windows
 ```
 
-全bundleを試す場合は次を使います。
+全 bundle:
 
 ```bash
 npm run tauri:build:all
@@ -46,14 +78,14 @@ npm run check
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-`npm run check` はフロントエンドのproduction buildとRustの型チェックを行います。Rustテストでは、日本語規程見出しのチャンク保持と、`扶養手当` のような短い語句のローカル検索を確認します。
+`npm run check` はフロントエンドの production build と Rust の型チェックを行います。
 
 ## 使い方
 
 1. アプリを起動する
-2. `source` ディレクトリを選択する
-3. `更新` を押す
-4. 回答対象ファイルにチェックを入れる
+2. 資料フォルダを選択する
+3. 更新ボタンでインデックスを作成する
+4. 回答対象のファイルを選択する
 5. 質問する
 
 対応拡張子:
@@ -67,34 +99,37 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - `.log`
 - `.text`
 
-## 検索と回答
+## 検索と回答の流れ
 
-回答は常に高精度網羅モードで行います。
+回答は常に高精度網羅モードで処理します。
 
-- 質問観点の展開
-- SQLite FTS5
-- 日本語n-gram index
-- ローカルベクトル検索
-- Reciprocal Rank Fusion相当の統合スコア
-- 選択中の全チャンクをbatch確認
-- batchごとの事実抽出
-- 抽出事実の永続保存
-- 事実統合
-- 最終回答生成
-- 回答監査
-- Markdown表示
+1. 質問観点を整理
+2. 関連資料を検索
+3. SQLite FTS5、n-gram、ローカルベクトル検索を統合
+4. 選択資料の候補チャンクを batch 確認
+5. fact を抽出
+6. fact を統合
+7. 回答を生成
+8. 回答の scope error / relationship error を監査
+9. Markdown として表示
 
-処理中、API送信中、rate limit待機、キャンセル、停止、完了はチャットの吹き出し内に表示されます。
+処理中、API 送信中、rate limit 待機、キャンセル、停止、完了などはチャット欄に状態表示します。
 
-## DeepSeek
+## DeepSeek API キー
 
-既定モデルは `deepseek-v4-flash` です。通常利用で迷わないよう、APIキー、モデル、thinking、reasoning effort、temperatureなどの詳細設定はUIに出していません。
+API キーはアプリ内で設定します。UI 上には詳細なモデル設定を出さず、通常利用では迷わない構成にしています。
 
-DeepSeek APIはOpenAI互換形式の `/chat/completions` を使います。API keyはOSの安全な保存領域へ保存します。OS Keychain / Credential Managerが使えない環境では、アプリがSQLite平文フォールバックへ切り替え、画面に警告を表示します。ログにはAPI keyを保存しません。
+保存先:
+
+- macOS: Keychain
+- Windows: Credential Manager
+- それらが使えない場合: SQLite 平文フォールバック
+
+平文フォールバック時は画面に警告を表示します。API キーはログへ出力しません。
 
 ## ローカルデータ
 
-アプリデータディレクトリに `mini-lm.sqlite3` を作成します。保存対象は以下です。
+アプリデータディレクトリに `mini-lm.sqlite3` を作成します。保存対象は次の通りです。
 
 - source path
 - documents
@@ -108,23 +143,21 @@ DeepSeek APIはOpenAI互換形式の `/chat/completions` を使います。API k
 - answers
 - logs
 
-ファイルの `mtime`、サイズ、hash を比較し、変更があるファイルだけ再インデックスします。
+これらはリポジトリ管理対象ではありません。
 
-## Git運用
+## GitHub へ公開する前の確認
 
-このリポジトリはローカルGitで管理します。GitHubリポジトリは不要です。作業の節目ごとにコミットします。
+```bash
+git status --short --ignored
+git ls-files
+```
 
-除外対象:
+`source/` や DB、`.env` が `git ls-files` に出ないことを確認してください。
 
-- `node_modules/`
-- `dist/`
-- `src-tauri/target/`
-- SQLite DB
-- `.env`
-- ログ
+すでに資料をコミットした履歴がある場合、単に `.gitignore` に追加するだけでは不十分です。GitHub に push する前に、履歴からも資料を削除してください。
 
 ## 既知の制限
 
-- 現在のベクトルは、外部モデルを使わないローカルn-gram hash embeddingです。ネットワーク不要で安定しますが、将来はONNX/Transformers系の多言語embeddingへ差し替えられる設計にしています。
-- 高精度網羅モードは選択チャンクを全件batch確認するため、APIコストと時間が大きくなります。
-- Windows用bundleはmacOS上では実作成できません。構成はTauriのクロスプラットフォーム前提ですが、Windows実機またはWindows CIでのビルド確認が必要です。
+- 現在の embedding は外部モデルを使わないローカル n-gram hash embedding です。
+- 高精度網羅モードは精度重視のため、質問によっては処理時間と API コストが大きくなります。
+- Windows 用 bundle は Windows 環境または Windows CI での確認が必要です。
