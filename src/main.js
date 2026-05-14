@@ -281,9 +281,11 @@ async function answerQuestion() {
       },
     });
     state.currentRunId = response.runId;
-    state.currentAssistantRaw = response.answer || state.currentAssistantRaw;
     const shouldStick = shouldAutoScroll();
-    renderMarkdown(state.currentAssistantBody, state.currentAssistantRaw);
+    if (response.answer && response.answer !== state.currentAssistantRaw) {
+      state.currentAssistantRaw = response.answer;
+      renderMarkdown(state.currentAssistantBody, state.currentAssistantRaw);
+    }
     renderAnswerFooter(assistant, state.currentAssistantRaw, performance.now() - answerStartedAt);
     scrollMessages({ force: shouldStick });
   } catch (error) {

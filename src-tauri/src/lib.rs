@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -26,7 +26,8 @@ const EMBEDDING_MODEL: &str = "mini-lm-ja-ngram-hash-v1";
 const EMBEDDING_DIMS: usize = 384;
 const DEFAULT_CONTEXT_CHARS: usize = 12_000;
 const DEFAULT_BATCH_CHARS: usize = 6_000;
-const MAX_EXTRACT_CONCURRENCY: usize = 3;
+const MAX_EXTRACT_CONCURRENCY: usize = 5;
+const EXTRACT_BATCH_TIMEOUT_SECS: u64 = 45;
 const MAX_REDUCED_FACTS: usize = 120;
 const MAX_SHORT_RATE_WAIT_MS: u64 = 15_000;
 const ALLOWED_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "csv", "tsv", "json", "log", "text"];
@@ -2761,10 +2762,21 @@ async fn extract_fact_batches(
                     run_id, batch_no, total, concurrency_snapshot, batch_chunks, batch_chars
                 ));
                 let batch_started = Instant::now();
-                let result = extract_facts_from_batch(
-                    &app, &settings, &question, &profile, &hierarchy, &batch, &run_id, &cancel,
+                let result = match timeout(
+                    Duration::from_secs(EXTRACT_BATCH_TIMEOUT_SECS),
+                    extract_facts_from_batch(
+                        &app, &settings, &question, &profile, &hierarchy, &batch, &run_id,
+                        &cancel,
+                    ),
                 )
-                .await;
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(format!(
+                        "soft_limit: 根拠抽出バッチが{}秒以内に返らなかったため、並列数を下げて再試行します",
+                        EXTRACT_BATCH_TIMEOUT_SECS
+                    )),
+                };
                 match &result {
                     Ok(facts) => log_extract_debug(format!(
                         "batch done run={} batch={}/{} facts={} elapsed_ms={}",
@@ -2846,8 +2858,11 @@ async fn extract_fact_batches(
 
             if concurrency > 1 {
                 let previous = concurrency;
-                let drop_count = rate_limited.len().max(1).min(concurrency - 1);
-                concurrency -= drop_count;
+                concurrency = if previous > 3 {
+                    3
+                } else {
+                    previous.saturating_sub(rate_limited.len().max(1)).max(1)
+                };
                 log_extract_debug(format!(
                     "concurrency downgrade run={} from={} to={} rate_limited_batches={}",
                     run_id,
@@ -2861,7 +2876,7 @@ async fn extract_fact_batches(
                     "extract",
                     "running",
                     &format!(
-                        "DeepSeekの制限を検知したため、並列数を{}から{}に下げて続行します",
+                        "DeepSeekの制限または応答遅延を検知したため、並列数を{}から{}に下げて続行します",
                         previous, concurrency
                     ),
                     Some(run_id.to_string()),
@@ -2918,10 +2933,13 @@ fn estimate_batch_chars(batch: &[ChunkRecord]) -> usize {
 fn is_rate_limit_error(error: &str) -> bool {
     let lower = error.to_lowercase();
     lower.starts_with("rate_limit:")
+        || lower.starts_with("soft_limit:")
         || lower.contains("too many requests")
         || lower.contains("429")
         || lower.contains("rate limit")
+        || lower.contains("timed out")
         || error.contains("制限")
+        || error.contains("返らなかった")
 }
 
 fn truncate_log_text(text: &str, max_chars: usize) -> String {
@@ -3915,7 +3933,7 @@ async fn revise_answer_from_audit(
         messages,
         3_000,
         false,
-        true,
+        false,
         Some(run_id),
         cancel,
     )
