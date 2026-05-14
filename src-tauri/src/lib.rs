@@ -1258,7 +1258,11 @@ fn pack_sections(sections: Vec<ChunkDraft>) -> Vec<ChunkDraft> {
         }
 
         let buffer_chars = buffer.chars().count();
-        if buffer_chars > 0 && buffer_chars + section_chars > target_chars {
+        let heading_changed = buffer_chars > 0
+            && !section.heading_path.is_empty()
+            && !heading.is_empty()
+            && section.heading_path != heading;
+        if buffer_chars > 0 && (buffer_chars + section_chars > target_chars || heading_changed) {
             chunks.push(ChunkDraft {
                 content: buffer.trim().to_string(),
                 heading_path: heading.clone(),
@@ -2605,5 +2609,49 @@ fn diversify_hits(hits: &mut Vec<SearchHit>, limit: usize) {
     hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
     if hits.len() > limit * 3 {
         hits.truncate(limit * 3);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn chunker_preserves_japanese_regulation_headings() {
+        let text = "第1章 総則\n（目的）\nこの規程は目的を定める。\n\n第2条 扶養手当\n扶養手当は条件を満たす職員に支給する。\n";
+        let chunks = split_text_into_chunks(text);
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().any(|chunk| chunk.heading_path.contains("第2条 扶養手当")));
+        assert!(chunks.iter().any(|chunk| chunk.content.contains("扶養手当")));
+    }
+
+    #[test]
+    fn index_and_hybrid_search_find_short_japanese_terms() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("mini-lm-test.sqlite3");
+        let source_dir = temp.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let file_path = source_dir.join("rules.txt");
+        fs::write(
+            &file_path,
+            "第1章 給与\n第1条 扶養手当\n扶養手当は、扶養親族を有する職員に支給する。\n第2条 通勤手当\n通勤手当は通勤距離に応じて支給する。\n",
+        )
+        .unwrap();
+
+        let state = AppStateInner::new(db_path);
+        init_db(&state).unwrap();
+        let mut conn = state.conn().unwrap();
+        set_setting(&conn, "source_path", source_dir.to_str().unwrap()).unwrap();
+        let outcome = index_one_file(&mut conn, &file_path).unwrap();
+        match outcome {
+            FileIndexOutcome::Indexed(count) => assert!(count > 0),
+            FileIndexOutcome::Skipped => panic!("first index should not be skipped"),
+        }
+
+        let response = hybrid_search_internal(&conn, "扶養手当", &[], 5).unwrap();
+        assert!(!response.hits.is_empty());
+        assert!(response.hits[0].snippet.contains("扶養手当"));
+        assert!(response.hits[0].ngram_score > 0.0 || response.hits[0].vector_score > 0.0);
     }
 }
