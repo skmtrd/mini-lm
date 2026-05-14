@@ -4844,45 +4844,51 @@ fn log_event(
 
 fn save_api_key(conn: &Connection, api_key: &str) -> Result<String, String> {
     let api_key = api_key.trim();
+    set_setting(conn, "api_key_plaintext", api_key)?;
+
     let entry = match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
         Ok(entry) => entry,
-        Err(error) => return save_api_key_fallback(conn, api_key, &error.to_string()),
+        Err(error) => return save_api_key_fallback(conn, &error.to_string()),
     };
 
     if let Err(error) = entry.set_password(api_key) {
-        return save_api_key_fallback(conn, api_key, &format!("keychain save failed: {error}"));
+        return save_api_key_fallback(conn, &format!("keychain save failed: {error}"));
     }
 
     match entry.get_password() {
         Ok(saved) if saved.trim() == api_key => {
-            delete_setting(conn, "api_key_plaintext")?;
             delete_setting(conn, "api_key_keychain_error")?;
-            set_setting(conn, "api_key_storage", "os-keychain")?;
-            Ok("os-keychain".to_string())
+            set_setting(conn, "api_key_storage", "local-db+os-keychain")?;
+            Ok("local-db+os-keychain".to_string())
         }
         Ok(_) => {
             let _ = entry.delete_credential();
-            save_api_key_fallback(conn, api_key, "keychain verification mismatch")
+            save_api_key_fallback(conn, "keychain verification mismatch")
         }
         Err(error) => {
             let _ = entry.delete_credential();
-            save_api_key_fallback(
-                conn,
-                api_key,
-                &format!("keychain verification failed: {error}"),
-            )
+            save_api_key_fallback(conn, &format!("keychain verification failed: {error}"))
         }
     }
 }
 
-fn save_api_key_fallback(conn: &Connection, api_key: &str, error: &str) -> Result<String, String> {
-    set_setting(conn, "api_key_plaintext", api_key)?;
-    set_setting(conn, "api_key_storage", "sqlite-plaintext-fallback")?;
+fn save_api_key_fallback(conn: &Connection, error: &str) -> Result<String, String> {
+    set_setting(conn, "api_key_storage", "local-db")?;
     set_setting(conn, "api_key_keychain_error", error)?;
-    Ok("sqlite-plaintext-fallback".to_string())
+    Ok("local-db".to_string())
 }
 
 fn load_api_key(conn: &Connection) -> (Option<String>, String) {
+    if let Ok(Some(value)) = get_setting(conn, "api_key_plaintext") {
+        if !value.trim().is_empty() {
+            let storage = get_setting(conn, "api_key_storage")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "local-db".to_string());
+            return (Some(value), storage);
+        }
+    }
+
     if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
         if let Ok(password) = entry.get_password() {
             if !password.trim().is_empty() {
@@ -4891,12 +4897,7 @@ fn load_api_key(conn: &Connection) -> (Option<String>, String) {
         }
     }
 
-    match get_setting(conn, "api_key_plaintext") {
-        Ok(Some(value)) if !value.trim().is_empty() => {
-            (Some(value), "sqlite-plaintext-fallback".to_string())
-        }
-        _ => (None, "none".to_string()),
-    }
+    (None, "none".to_string())
 }
 
 fn delete_api_key(conn: &Connection) -> Result<(), String> {
