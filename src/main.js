@@ -10,14 +10,25 @@ marked.setOptions({
   gfm: true,
 });
 
+const ARCHIVE_STORAGE_KEY = "mini-lm.archivedSessions.v1";
+const TYPEWRITER_INTERVAL_MS = 16;
+const TYPEWRITER_CHARS_PER_TICK = 12;
+
 const state = {
   snapshot: null,
   busy: false,
+  archives: [],
+  activeArchiveId: null,
+  currentMessages: [],
   currentRunId: null,
   currentAssistantArticle: null,
   currentAssistantBody: null,
   currentAssistantRaw: "",
+  currentAssistantQueued: "",
   currentAssistantHasAnswer: false,
+  currentAssistantMessageId: null,
+  typewriterTimer: null,
+  typewriterResolvers: [],
   toastSeq: 0,
   autoScroll: true,
   lastProgressStage: "profile",
@@ -26,7 +37,7 @@ const state = {
 document.querySelector("#app").innerHTML = `
   <div class="shell">
     <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="false"></div>
-    <aside class="sidebar">
+    <aside class="sidebar source-sidebar">
       <section class="source-panel">
         <div class="source-head">
           <h2>資料</h2>
@@ -67,7 +78,14 @@ document.querySelector("#app").innerHTML = `
           placeholder="質問を入力..."
         ></textarea>
         <div class="composer-actions">
-          <button id="clearMessagesButton" type="button">履歴クリア</button>
+          <button id="archiveButton" class="icon-button" type="button" title="アーカイブ" aria-label="アーカイブ">
+            <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24">
+              <rect x="3" y="4" width="18" height="4" rx="1"></rect>
+              <path d="M5 8v11a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"></path>
+              <path d="M10 13h4"></path>
+            </svg>
+          </button>
+          <span class="composer-spacer"></span>
           <button id="cancelButton" class="icon-button" type="button" disabled title="停止" aria-label="停止">
             <svg class="action-icon stop-icon" aria-hidden="true" viewBox="0 0 24 24">
               <rect x="7" y="7" width="10" height="10" rx="1.5"></rect>
@@ -82,6 +100,13 @@ document.querySelector("#app").innerHTML = `
         </div>
       </form>
     </main>
+
+    <aside class="history-sidebar">
+      <div class="history-head">
+        <h2>履歴</h2>
+      </div>
+      <div id="historyList" class="history-list"></div>
+    </aside>
   </div>
 `;
 
@@ -101,14 +126,17 @@ const els = {
   cancelButton: $("#cancelButton"),
   questionForm: $("#questionForm"),
   questionInput: $("#questionInput"),
-  clearMessagesButton: $("#clearMessagesButton"),
+  archiveButton: $("#archiveButton"),
   sendButton: $("#sendButton"),
   toastRegion: $("#toastRegion"),
+  historyList: $("#historyList"),
 };
 
 init();
 
 async function init() {
+  state.archives = loadArchives();
+  renderArchives();
   wireEvents();
   await listen("task-progress", (event) => {
     renderProgress(event.payload);
@@ -116,11 +144,8 @@ async function init() {
   await listen("answer-delta", (event) => {
     const payload = event.payload;
     if (!state.currentAssistantBody || payload.runId !== state.currentRunId) return;
-    const shouldStick = shouldAutoScroll();
     state.currentAssistantHasAnswer = true;
-    state.currentAssistantRaw += payload.delta;
-    renderMarkdown(state.currentAssistantBody, state.currentAssistantRaw);
-    scrollMessages({ force: shouldStick });
+    enqueueAssistantDelta(payload.delta || "");
   });
   await refreshSnapshot();
 }
@@ -142,9 +167,8 @@ function wireEvents() {
     await invoke("cancel_current_task");
     renderAssistantStatus("停止しています", "現在の処理へキャンセル要求を送りました。");
   });
-  els.clearMessagesButton.addEventListener("click", () => {
-    clearMessages();
-    showToast("履歴をクリアしました", "チャット欄を空にしました。", "info");
+  els.archiveButton.addEventListener("click", () => {
+    archiveCurrentConversation();
   });
   els.messages.addEventListener("scroll", () => {
     state.autoScroll = isNearBottom();
@@ -157,6 +181,11 @@ function wireEvents() {
   els.questionForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     await answerQuestion();
+  });
+  els.historyList.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-archive-id]");
+    if (!button) return;
+    loadArchiveSession(button.dataset.archiveId);
   });
 }
 
@@ -266,8 +295,10 @@ async function answerQuestion() {
   const assistant = addMessage("assistant", "", { markdown: true });
   state.currentAssistantArticle = assistant;
   state.currentAssistantBody = assistant.querySelector(".body");
+  state.currentAssistantMessageId = assistant.dataset.messageId;
   state.currentRunId = null;
   state.currentAssistantRaw = "";
+  state.currentAssistantQueued = "";
   state.currentAssistantHasAnswer = false;
   state.lastProgressStage = "profile";
 
@@ -281,27 +312,40 @@ async function answerQuestion() {
       },
     });
     state.currentRunId = response.runId;
+    syncFinalAnswer(response.answer || "");
+    await waitForTypewriterIdle();
     const shouldStick = shouldAutoScroll();
-    if (response.answer && response.answer !== state.currentAssistantRaw) {
-      state.currentAssistantRaw = response.answer;
-      renderMarkdown(state.currentAssistantBody, state.currentAssistantRaw);
-    }
+    updateMessage(assistant.dataset.messageId, {
+      text: state.currentAssistantRaw,
+      elapsedMs: performance.now() - answerStartedAt,
+      failed: false,
+    });
     renderAnswerFooter(assistant, state.currentAssistantRaw, performance.now() - answerStartedAt);
+    saveActiveConversation();
     scrollMessages({ force: shouldStick });
   } catch (error) {
+    await waitForTypewriterIdle();
     const message = state.currentAssistantRaw
       ? `${state.currentAssistantRaw}\n\n---\n\n回答に失敗しました。処理は停止しました。\n\n理由: ${String(error)}`
       : `回答に失敗しました。処理は停止しました。\n\n理由: ${String(error)}`;
     const shouldStick = shouldAutoScroll();
     renderMarkdown(state.currentAssistantBody, message);
+    updateMessage(assistant.dataset.messageId, {
+      text: message,
+      elapsedMs: performance.now() - answerStartedAt,
+      failed: true,
+    });
     renderAnswerFooter(assistant, message, performance.now() - answerStartedAt, { failed: true });
+    saveActiveConversation();
     scrollMessages({ force: shouldStick });
   } finally {
     state.currentAssistantArticle = null;
     state.currentAssistantBody = null;
     state.currentRunId = null;
     state.currentAssistantRaw = "";
+    state.currentAssistantQueued = "";
     state.currentAssistantHasAnswer = false;
+    state.currentAssistantMessageId = null;
     setBusy(false);
   }
 }
@@ -311,6 +355,9 @@ function selectedDocumentIds() {
 }
 
 function clearMessages() {
+  resetTypewriter();
+  state.activeArchiveId = null;
+  state.currentMessages = [];
   els.messages.innerHTML = `
     <article class="message assistant">
       <div class="body markdown-body">
@@ -319,6 +366,119 @@ function clearMessages() {
     </article>
   `;
   scrollMessages({ force: true });
+  renderArchives();
+}
+
+function archiveCurrentConversation() {
+  const saved = saveActiveConversation();
+  if (!saved) {
+    showToast("アーカイブできる会話がありません", "質問と回答がある会話だけ保存できます。", "info");
+    return;
+  }
+  clearMessages();
+  showToast("アーカイブしました", "現在の会話を履歴へ保存しました。", "success");
+}
+
+function saveActiveConversation() {
+  const messages = state.currentMessages
+    .filter((message) => message.text && message.text.trim())
+    .map((message) => ({ ...message }));
+  if (!messages.length || !messages.some((message) => message.role === "user")) {
+    return null;
+  }
+
+  const now = Date.now();
+  const existing = state.activeArchiveId
+    ? state.archives.find((archive) => archive.id === state.activeArchiveId)
+    : null;
+  const archive = {
+    id: existing?.id || createId(),
+    title: buildArchiveTitle(messages),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+    messages,
+  };
+
+  state.activeArchiveId = archive.id;
+  state.archives = [archive, ...state.archives.filter((item) => item.id !== archive.id)].slice(0, 80);
+  persistArchives();
+  renderArchives();
+  return archive;
+}
+
+function loadArchiveSession(id) {
+  if (state.busy) return;
+  const archive = state.archives.find((item) => item.id === id);
+  if (!archive) return;
+  resetTypewriter();
+  state.activeArchiveId = archive.id;
+  state.currentMessages = archive.messages.map((message) => ({ ...message, id: message.id || createId() }));
+  renderCurrentMessages();
+  renderArchives();
+  showToast("履歴を開きました", "この会話の続きとして質問できます。", "info");
+}
+
+function renderArchives() {
+  if (!els.historyList) return;
+  if (!state.archives.length) {
+    els.historyList.innerHTML = `<div class="empty-box">まだ履歴がありません</div>`;
+    return;
+  }
+
+  els.historyList.innerHTML = state.archives
+    .map((archive) => {
+      const active = archive.id === state.activeArchiveId ? " active" : "";
+      return `
+        <button class="history-item${active}" type="button" data-archive-id="${escapeHtml(archive.id)}">
+          <strong>${escapeHtml(archive.title)}</strong>
+          <span>${escapeHtml(formatDateTime(archive.updatedAt))} ・ ${formatNumber(archive.messages.length)}件</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderCurrentMessages() {
+  els.messages.innerHTML = "";
+  if (!state.currentMessages.length) {
+    clearMessages();
+    return;
+  }
+  for (const message of state.currentMessages) {
+    const article = addMessage(message.role, message.text, {
+      markdown: message.role === "assistant",
+      persist: false,
+      messageId: message.id,
+    });
+    if (message.role === "assistant" && message.text) {
+      renderAnswerFooter(article, message.text, message.elapsedMs || 0, { failed: message.failed });
+    }
+  }
+  scrollMessages({ force: true });
+}
+
+function loadArchives() {
+  try {
+    const raw = localStorage.getItem(ARCHIVE_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((item) => item && item.id && Array.isArray(item.messages)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistArchives() {
+  try {
+    localStorage.setItem(ARCHIVE_STORAGE_KEY, JSON.stringify(state.archives));
+  } catch (error) {
+    showToast("履歴の保存に失敗しました", String(error), "error");
+  }
+}
+
+function buildArchiveTitle(messages) {
+  const firstUser = messages.find((message) => message.role === "user" && message.text.trim());
+  const title = firstUser?.text.trim().replace(/\s+/g, " ") || "無題の会話";
+  return title.length > 34 ? `${title.slice(0, 34)}...` : title;
 }
 
 function renderProgress(payload) {
@@ -455,6 +615,8 @@ function clearPersistentToasts() {
 function addMessage(role, text, options = {}) {
   const article = document.createElement("article");
   article.className = `message ${role}`;
+  const messageId = options.messageId || createId();
+  article.dataset.messageId = messageId;
   article.innerHTML = `<div class="body ${options.markdown ? "markdown-body" : ""}"></div>`;
   const body = article.querySelector(".body");
   if (options.markdown) {
@@ -462,9 +624,24 @@ function addMessage(role, text, options = {}) {
   } else {
     body.textContent = text;
   }
+  if (options.persist !== false) {
+    state.currentMessages.push({
+      id: messageId,
+      role,
+      text,
+      createdAt: Date.now(),
+      elapsedMs: null,
+      failed: false,
+    });
+  }
   els.messages.append(article);
   scrollMessages({ force: role === "user" || shouldAutoScroll() });
   return article;
+}
+
+function updateMessage(id, patch) {
+  const message = state.currentMessages.find((item) => item.id === id);
+  if (message) Object.assign(message, patch);
 }
 
 function renderMarkdown(element, source) {
@@ -496,6 +673,79 @@ function renderAnswerFooter(article, text, elapsedMs, options = {}) {
   article.append(footer);
 }
 
+function enqueueAssistantDelta(delta) {
+  if (!delta) return;
+  state.currentAssistantQueued += delta;
+  startTypewriter();
+}
+
+function startTypewriter() {
+  if (state.typewriterTimer || !state.currentAssistantBody) return;
+  state.typewriterTimer = window.setInterval(() => {
+    if (!state.currentAssistantBody) {
+      resetTypewriter();
+      return;
+    }
+    if (!state.currentAssistantQueued) {
+      stopTypewriter();
+      resolveTypewriterWaiters();
+      return;
+    }
+
+    const shouldStick = shouldAutoScroll();
+    const next = state.currentAssistantQueued.slice(0, TYPEWRITER_CHARS_PER_TICK);
+    state.currentAssistantQueued = state.currentAssistantQueued.slice(next.length);
+    state.currentAssistantRaw += next;
+    renderMarkdown(state.currentAssistantBody, state.currentAssistantRaw);
+    scrollMessages({ force: shouldStick });
+
+    if (!state.currentAssistantQueued) {
+      stopTypewriter();
+      resolveTypewriterWaiters();
+    }
+  }, TYPEWRITER_INTERVAL_MS);
+}
+
+function syncFinalAnswer(answer) {
+  if (!answer) return;
+  const known = state.currentAssistantRaw + state.currentAssistantQueued;
+  if (answer === known) return;
+  if (answer.startsWith(state.currentAssistantRaw)) {
+    state.currentAssistantQueued = answer.slice(state.currentAssistantRaw.length);
+  } else {
+    state.currentAssistantRaw = "";
+    state.currentAssistantQueued = answer;
+    if (state.currentAssistantBody) renderMarkdown(state.currentAssistantBody, "");
+  }
+  startTypewriter();
+}
+
+function waitForTypewriterIdle() {
+  if (!state.currentAssistantQueued && !state.typewriterTimer) return Promise.resolve();
+  return new Promise((resolve) => {
+    state.typewriterResolvers.push(resolve);
+    startTypewriter();
+  });
+}
+
+function stopTypewriter() {
+  if (state.typewriterTimer) {
+    window.clearInterval(state.typewriterTimer);
+    state.typewriterTimer = null;
+  }
+}
+
+function resetTypewriter() {
+  stopTypewriter();
+  state.currentAssistantQueued = "";
+  resolveTypewriterWaiters();
+}
+
+function resolveTypewriterWaiters() {
+  const resolvers = state.typewriterResolvers.splice(0);
+  resolvers.forEach((resolve) => resolve());
+}
+
 function setBusy(busy) {
   state.busy = busy;
   els.sidebar.classList.toggle("is-locked", busy);
@@ -503,7 +753,7 @@ function setBusy(busy) {
   els.indexButton.disabled = busy;
   els.selectAllButton.disabled = busy;
   els.clearSelectionButton.disabled = busy;
-  els.clearMessagesButton.disabled = busy;
+  els.archiveButton.disabled = busy;
   els.sendButton.disabled = busy;
   els.cancelButton.disabled = !busy;
   els.questionInput.disabled = busy;
@@ -543,6 +793,20 @@ function formatElapsed(ms) {
   const minutes = Math.floor(seconds / 60);
   const rest = seconds % 60;
   return minutes ? `${minutes}分${rest}秒` : `${rest}秒`;
+}
+
+function formatDateTime(timestamp) {
+  return new Intl.DateTimeFormat("ja-JP", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestamp || Date.now()));
+}
+
+function createId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 function escapeHtml(value) {

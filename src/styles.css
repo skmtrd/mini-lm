@@ -164,7 +164,7 @@ button.primary {
 
 .shell {
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: 320px minmax(0, 1fr) 280px;
   height: 100vh;
   overflow: hidden;
 }
@@ -178,6 +178,60 @@ button.primary {
 
 .sidebar.is-locked .file-row {
   opacity: 0.72;
+}
+
+.history-sidebar {
+  overflow: auto;
+  padding: 14px;
+  border-left: 1px solid #d8e0e6;
+  background: #f2f5f7;
+}
+
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.history-head h2 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: 0;
+}
+
+.history-list {
+  display: grid;
+  gap: 8px;
+}
+
+.history-item {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  border: 1px solid #d8e0e6;
+  border-radius: 6px;
+  padding: 9px;
+  background: #ffffff;
+  text-align: left;
+}
+
+.history-item.active {
+  border-color: #126b61;
+  background: #e7f2f0;
+}
+
+.history-item strong {
+  overflow: hidden;
+  color: #1f252b;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-item span {
+  color: #667582;
+  font-size: 12px;
 }
 
 .source-panel {
@@ -332,24 +386,25 @@ button.primary {
   height: 40px;
   place-items: center;
   border-color: #b8c7d1;
-  border-radius: 999px;
+  border-radius: 6px;
   padding: 0;
   background: #ffffff;
   box-shadow: 0 8px 20px rgb(31 37 43 / 13%);
 }
 
 .message {
-  max-width: 860px;
+  max-width: min(1120px, 100%);
   margin-bottom: 14px;
 }
 
 .message.user {
   margin-left: auto;
-  max-width: min(720px, 82%);
+  max-width: min(720px, 72%);
 }
 
 .message.assistant {
   margin-right: auto;
+  width: min(1120px, 100%);
 }
 
 .message .body {
@@ -418,6 +473,10 @@ button.primary {
 .composer-actions {
   justify-content: flex-end;
   margin-top: 8px;
+}
+
+.composer-spacer {
+  flex: 1;
 }
 
 .thinking {
@@ -595,12 +654,21 @@ button.primary {
 @media (max-width: 880px) {
   .shell {
     grid-template-columns: 1fr;
-    grid-template-rows: auto 1fr;
+    grid-template-rows: auto 1fr auto;
   }
 
-  .sidebar {
+  .sidebar,
+  .history-sidebar {
     max-height: 42vh;
     border-right: 0;
     border-bottom: 1px solid #d8e0e6;
+  }
+
+  .history-sidebar {
+    border-left: 0;
+  }
+
+  .message.user {
+    max-width: 86%;
   }
 }
