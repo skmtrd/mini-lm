@@ -213,6 +213,10 @@ button.primary {
   position: relative;
 }
 
+.history-row.has-menu-open {
+  z-index: 12;
+}
+
 .history-item {
   display: grid;
   gap: 2px;
@@ -251,6 +255,7 @@ button.primary {
   position: absolute;
   top: 50%;
   right: 6px;
+  z-index: 3;
   display: inline-grid;
   width: 30px;
   height: 30px;

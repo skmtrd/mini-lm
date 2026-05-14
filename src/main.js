@@ -184,24 +184,32 @@ function wireEvents() {
   els.historyList.addEventListener("click", (event) => {
     const archiveButton = event.target.closest("[data-archive-chat-id]");
     if (archiveButton) {
+      event.preventDefault();
+      event.stopPropagation();
       archiveChat(archiveButton.dataset.archiveChatId);
       return;
     }
 
     const menuButton = event.target.closest("[data-archived-menu-id]");
     if (menuButton) {
+      event.preventDefault();
+      event.stopPropagation();
       toggleArchivedChatMenu(menuButton.dataset.archivedMenuId);
       return;
     }
 
     const restoreButton = event.target.closest("[data-restore-archived-chat-id]");
     if (restoreButton) {
+      event.preventDefault();
+      event.stopPropagation();
       restoreArchivedChat(restoreButton.dataset.restoreArchivedChatId);
       return;
     }
 
     const deleteButton = event.target.closest("[data-delete-archived-chat-id]");
     if (deleteButton) {
+      event.preventDefault();
+      event.stopPropagation();
       deleteArchivedChat(deleteButton.dataset.deleteArchivedChatId);
       return;
     }
@@ -646,7 +654,7 @@ function renderChatItem(chat, status) {
       `
       : "";
   return `
-    <div class="history-row${active}">
+    <div class="history-row${active}${menuOpen ? " has-menu-open" : ""}">
       <button class="history-item${active}" type="button" data-chat-id="${escapeHtml(chat.id)}" data-chat-status="${escapeHtml(status)}">
         <strong>${escapeHtml(chat.title || buildChatTitle(chat.messages))}</strong>
         <span>${escapeHtml(formatDateTime(chat.updatedAt || chat.createdAt))}</span>
