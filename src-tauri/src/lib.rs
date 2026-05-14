@@ -2732,6 +2732,16 @@ async fn extract_fact_batches(
             }
         }
 
+        let wave_batches = wave
+            .iter()
+            .map(|(index, _)| (index + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        log_extract_debug(format!(
+            "wave start run={} label={} concurrency={} completed={}/{} batches=[{}]",
+            run_id, label, concurrency, completed, total, wave_batches
+        ));
+
         let tasks = wave.into_iter().map(|(index, batch)| {
             let app = app.clone();
             let settings = settings.clone();
@@ -2741,11 +2751,43 @@ async fn extract_fact_batches(
             let run_id = run_id.to_string();
             let cancel = cancel.clone();
             let retry_batch = batch.clone();
+            let batch_no = index + 1;
+            let batch_chunks = batch.len();
+            let batch_chars = estimate_batch_chars(&batch);
+            let concurrency_snapshot = concurrency;
             async move {
+                log_extract_debug(format!(
+                    "batch start run={} batch={}/{} concurrency={} chunks={} approx_chars={}",
+                    run_id, batch_no, total, concurrency_snapshot, batch_chunks, batch_chars
+                ));
+                let batch_started = Instant::now();
                 let result = extract_facts_from_batch(
                     &app, &settings, &question, &profile, &hierarchy, &batch, &run_id, &cancel,
                 )
                 .await;
+                match &result {
+                    Ok(facts) => log_extract_debug(format!(
+                        "batch done run={} batch={}/{} facts={} elapsed_ms={}",
+                        run_id,
+                        batch_no,
+                        total,
+                        facts.len(),
+                        batch_started.elapsed().as_millis()
+                    )),
+                    Err(error) => log_extract_debug(format!(
+                        "batch error run={} batch={}/{} class={} elapsed_ms={} message={}",
+                        run_id,
+                        batch_no,
+                        total,
+                        if is_rate_limit_error(error) {
+                            "rate_limit"
+                        } else {
+                            "error"
+                        },
+                        batch_started.elapsed().as_millis(),
+                        truncate_log_text(error, 180)
+                    )),
+                }
                 BatchExtraction {
                     index,
                     batch: retry_batch,
@@ -2806,6 +2848,13 @@ async fn extract_fact_batches(
                 let previous = concurrency;
                 let drop_count = rate_limited.len().max(1).min(concurrency - 1);
                 concurrency -= drop_count;
+                log_extract_debug(format!(
+                    "concurrency downgrade run={} from={} to={} rate_limited_batches={}",
+                    run_id,
+                    previous,
+                    concurrency,
+                    rate_limited.len()
+                ));
                 emit_progress(
                     app,
                     started,
@@ -2824,6 +2873,11 @@ async fn extract_fact_batches(
                 continue;
             }
 
+            log_extract_debug(format!(
+                "rate limit stop run={} concurrency=1 rate_limited_batches={}",
+                run_id,
+                rate_limited.len()
+            ));
             emit_progress(
                 app,
                 started,
@@ -2854,6 +2908,13 @@ async fn extract_fact_batches(
     Ok(())
 }
 
+fn estimate_batch_chars(batch: &[ChunkRecord]) -> usize {
+    batch
+        .iter()
+        .map(|chunk| chunk.content.chars().count() + chunk.heading_path.chars().count())
+        .sum()
+}
+
 fn is_rate_limit_error(error: &str) -> bool {
     let lower = error.to_lowercase();
     lower.starts_with("rate_limit:")
@@ -2862,6 +2923,22 @@ fn is_rate_limit_error(error: &str) -> bool {
         || lower.contains("rate limit")
         || error.contains("制限")
 }
+
+fn truncate_log_text(text: &str, max_chars: usize) -> String {
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+#[cfg(debug_assertions)]
+fn log_extract_debug(message: impl AsRef<str>) {
+    eprintln!("[mini-lm extract] {}", message.as_ref());
+}
+
+#[cfg(not(debug_assertions))]
+fn log_extract_debug(_: impl AsRef<str>) {}
 
 fn corrective_retrieval_internal(
     conn: &Connection,
