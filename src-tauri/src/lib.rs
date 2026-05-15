@@ -3670,7 +3670,25 @@ async fn parse_facts_json_with_repair(
     cancel: &Arc<AtomicBool>,
 ) -> Result<JsonValue, String> {
     match serde_json::from_str::<JsonValue>(raw_content) {
-        Ok(value) => return Ok(value),
+        Ok(value) => match validate_facts_json(value) {
+            Ok(value) => return Ok(value),
+            Err(schema_error) => {
+                log_extract_debug(format!(
+                    "fact json schema invalid run={} batch_chunks={} batch_chars={} chunk_ids={} error={} raw={}",
+                    run_id,
+                    batch.len(),
+                    estimate_batch_chars(batch),
+                    batch
+                        .iter()
+                        .take(24)
+                        .map(|chunk| chunk.id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    schema_error,
+                    truncate_log_text(raw_content, 300)
+                ));
+            }
+        },
         Err(parse_error) => {
             log_extract_debug(format!(
                 "fact json parse failed run={} batch_chunks={} batch_chars={} chunk_ids={} error={} raw={}",
@@ -3687,7 +3705,7 @@ async fn parse_facts_json_with_repair(
                 truncate_log_text(raw_content, 300)
             ));
 
-            match parse_json_object_locally(raw_content) {
+            let local_error = match parse_facts_json_locally(raw_content) {
                 Ok(value) => {
                     log_extract_debug(format!(
                         "fact json local repair succeeded run={} batch_chunks={}",
@@ -3701,18 +3719,57 @@ async fn parse_facts_json_with_repair(
                         "fact json local repair failed run={} error={}",
                         run_id, local_error
                     ));
+                    local_error
                 }
-            }
+            };
 
-            repair_facts_json(app, settings, raw_content, run_id, cancel)
+            return repair_facts_json(app, settings, raw_content, run_id, cancel)
                 .await
                 .map_err(|repair_error| {
                     format!(
-                        "fact_json_parse_failed: DeepSeek応答をJSONとして解析できませんでした: {}; repair={}",
-                        parse_error, repair_error
+                        "fact_json_parse_failed: DeepSeek応答をfacts配列JSONとして解析できませんでした: parse={}; local_repair={}; llm_repair={}",
+                        parse_error, local_error, repair_error
                     )
-                })
+                });
         }
+    }
+
+    let local_error = match parse_facts_json_locally(raw_content) {
+        Ok(value) => {
+            log_extract_debug(format!(
+                "fact json local schema repair succeeded run={} batch_chunks={}",
+                run_id,
+                batch.len()
+            ));
+            return Ok(value);
+        }
+        Err(local_error) => {
+            log_extract_debug(format!(
+                "fact json local schema repair failed run={} error={}",
+                run_id, local_error
+            ));
+            local_error
+        }
+    };
+
+    repair_facts_json(app, settings, raw_content, run_id, cancel)
+        .await
+        .map_err(|repair_error| {
+            format!(
+                "fact_json_schema_failed: DeepSeek応答にfacts配列がありませんでした: local_repair={}; llm_repair={}",
+                local_error, repair_error
+            )
+        })
+}
+
+fn parse_facts_json_locally(raw: &str) -> Result<JsonValue, String> {
+    validate_facts_json(parse_json_object_locally(raw)?)
+}
+
+fn validate_facts_json(value: JsonValue) -> Result<JsonValue, String> {
+    match value.get("facts").and_then(|facts| facts.as_array()) {
+        Some(_) => Ok(value),
+        None => Err("fact_json_schema_invalid: facts must be an array".to_string()),
     }
 }
 
@@ -3780,7 +3837,7 @@ async fn repair_facts_json(
         cancel,
     )
     .await?;
-    parse_json_object_locally(&repaired).map_err(|error| {
+    parse_facts_json_locally(&repaired).map_err(|error| {
         format!(
             "fact JSON repair failed: {}; raw={}",
             error,
@@ -5511,7 +5568,7 @@ mod tests {
 
     #[test]
     fn fact_json_local_repair_parses_markdown_code_fence() {
-        let parsed = parse_json_object_locally(
+        let parsed = parse_facts_json_locally(
             r#"```json
 {"facts":[{"chunk_id":1,"statement":"扶養手当は支給する。"}]}
 ```"#,
@@ -5523,7 +5580,7 @@ mod tests {
 
     #[test]
     fn fact_json_local_repair_extracts_json_from_surrounding_text() {
-        let parsed = parse_json_object_locally(
+        let parsed = parse_facts_json_locally(
             r#"以下が抽出結果です。
 {"facts":[{"chunk_id":2,"statement":"住宅手当は条件付きで支給する。"}]}
 以上です。"#,
@@ -5535,9 +5592,23 @@ mod tests {
 
     #[test]
     fn fact_json_local_repair_returns_error_for_invalid_json() {
-        let error = parse_json_object_locally("facts: [broken]").unwrap_err();
+        let error = parse_facts_json_locally("facts: [broken]").unwrap_err();
 
         assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn fact_json_validation_rejects_missing_facts_array() {
+        let error = validate_facts_json(json!({"items": []})).unwrap_err();
+
+        assert!(error.contains("facts"));
+    }
+
+    #[test]
+    fn fact_json_validation_rejects_non_object_json() {
+        let error = validate_facts_json(json!([])).unwrap_err();
+
+        assert!(error.contains("facts"));
     }
 
     #[test]
