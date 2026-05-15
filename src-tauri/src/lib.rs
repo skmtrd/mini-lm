@@ -1451,7 +1451,7 @@ fn index_one_file(conn: &mut Connection, path: &Path) -> Result<FileIndexOutcome
     )
     .map_err(|e| e.to_string())?;
 
-    let chunks = split_text_into_chunks(&text);
+    let chunks = split_text_into_chunks_for_path(&text, path);
     let indexed_at = Utc::now().to_rfc3339();
     let mut inserted_ids = Vec::with_capacity(chunks.len());
 
@@ -1787,6 +1787,17 @@ fn first_chars(text: &str, max_chars: usize) -> String {
     out.replace('\n', " ")
 }
 
+fn split_text_into_chunks_for_path(text: &str, path: &Path) -> Vec<ChunkDraft> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+    {
+        Some(ext) if ext == "md" || ext == "markdown" => split_markdown_into_chunks(text),
+        _ => split_text_into_chunks(text),
+    }
+}
+
 fn split_text_into_chunks(text: &str) -> Vec<ChunkDraft> {
     let heading_re =
         Regex::new(r"^\s*(第[0-9０-９一二三四五六七八九十百千]+(章|節|款|目|条).*)\s*$").unwrap();
@@ -1835,6 +1846,156 @@ fn split_text_into_chunks(text: &str) -> Vec<ChunkDraft> {
     }
 
     pack_sections(sections)
+}
+
+fn split_markdown_into_chunks(text: &str) -> Vec<ChunkDraft> {
+    let heading_re =
+        Regex::new(r"^\s*(第[0-9０-９一二三四五六七八九十百千]+(章|節|款|目|条).*)\s*$").unwrap();
+    let bracket_re = Regex::new(r"^\s*（[^）]{1,60}）\s*$").unwrap();
+    let mut sections = Vec::new();
+    let mut markdown_stack: Vec<String> = Vec::new();
+    let mut regulation_stack: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_heading = String::new();
+    let mut current_start = 0i64;
+    let mut char_cursor = 0i64;
+    let mut in_code_fence = false;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let is_fence = is_markdown_code_fence(trimmed);
+        let markdown_heading = if !in_code_fence && !is_fence {
+            parse_markdown_heading(trimmed)
+        } else {
+            None
+        };
+        let regulation_heading = if !in_code_fence
+            && !is_fence
+            && markdown_heading.is_none()
+            && (heading_re.is_match(trimmed) || bracket_re.is_match(trimmed))
+        {
+            Some(trimmed)
+        } else {
+            None
+        };
+
+        if markdown_heading.is_some() || regulation_heading.is_some() {
+            if !current.trim().is_empty() {
+                let end = current_start + current.chars().count() as i64;
+                sections.push(ChunkDraft {
+                    content: current.trim().to_string(),
+                    heading_path: current_heading.clone(),
+                    char_start: current_start,
+                    char_end: end,
+                });
+                current.clear();
+                current_start = char_cursor;
+            } else if current.is_empty() {
+                current_start = char_cursor;
+            }
+            if let Some((level, heading_text)) = markdown_heading {
+                update_markdown_heading_stack(&mut markdown_stack, level, &heading_text);
+                regulation_stack.clear();
+            } else if let Some(heading_text) = regulation_heading {
+                update_heading_stack(&mut regulation_stack, heading_text);
+            }
+            current_heading = combined_markdown_heading_path(&markdown_stack, &regulation_stack);
+        } else if current.is_empty() {
+            current_start = char_cursor;
+        }
+
+        current.push_str(line);
+        char_cursor += line.chars().count() as i64;
+
+        if is_fence {
+            in_code_fence = !in_code_fence;
+        }
+    }
+
+    if !current.trim().is_empty() {
+        let end = current_start + current.chars().count() as i64;
+        sections.push(ChunkDraft {
+            content: current.trim().to_string(),
+            heading_path: current_heading,
+            char_start: current_start,
+            char_end: end,
+        });
+    }
+
+    pack_sections(sections)
+}
+
+fn combined_markdown_heading_path(
+    markdown_stack: &[String],
+    regulation_stack: &[String],
+) -> String {
+    markdown_stack
+        .iter()
+        .chain(regulation_stack.iter())
+        .filter(|heading| !heading.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" > ")
+}
+
+fn parse_markdown_heading(trimmed: &str) -> Option<(usize, String)> {
+    let level = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = &trimmed[level..];
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let heading = trim_markdown_heading_closing_sequence(rest.trim());
+    if heading.is_empty() {
+        None
+    } else {
+        Some((level, heading))
+    }
+}
+
+fn trim_markdown_heading_closing_sequence(heading: &str) -> String {
+    let trimmed = heading.trim();
+    let mut hash_start = trimmed.len();
+    for (index, ch) in trimmed.char_indices().rev() {
+        if ch == '#' {
+            hash_start = index;
+        } else {
+            break;
+        }
+    }
+    if hash_start < trimmed.len() {
+        let before_hash = &trimmed[..hash_start];
+        if before_hash
+            .chars()
+            .last()
+            .is_some_and(|ch| ch.is_whitespace())
+        {
+            return before_hash.trim_end().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn update_markdown_heading_stack(stack: &mut Vec<String>, level: usize, heading: &str) {
+    let index = level.saturating_sub(1);
+    if stack.len() <= index {
+        stack.resize(index + 1, String::new());
+    }
+    stack[index] = heading.trim().to_string();
+    stack.truncate(index + 1);
+}
+
+fn is_markdown_code_fence(trimmed: &str) -> bool {
+    let marker = if trimmed.starts_with("```") {
+        '`'
+    } else if trimmed.starts_with("~~~") {
+        '~'
+    } else {
+        return false;
+    };
+    trimmed.chars().take_while(|ch| *ch == marker).count() >= 3
 }
 
 fn update_heading_stack(stack: &mut Vec<String>, heading: &str) {
@@ -3168,13 +3329,15 @@ fn push_unique_fact(facts: &mut Vec<ExtractedFact>, fact: ExtractedFact) -> bool
 
 fn fact_identity(fact: &ExtractedFact) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         fact.chunk_id,
         fact.scope.trim(),
         fact.subject.trim(),
         fact.object.trim(),
         fact.condition.trim(),
-        fact.effect.trim()
+        fact.effect.trim(),
+        fact.exception.trim(),
+        fact.polarity.trim()
     )
 }
 
@@ -3976,23 +4139,241 @@ async fn reduce_facts(
         cancel,
     )
     .await?;
-    let parsed = serde_json::from_str::<JsonValue>(&content).unwrap_or_else(|_| json!({}));
-    let mut reduced = Vec::new();
-    if let Some(indexes) = parsed.get("keep_indexes").and_then(|v| v.as_array()) {
-        for index in indexes {
-            if let Some(i) = index.as_u64() {
-                if let Some(fact) = facts.get(i.saturating_sub(1) as usize) {
-                    reduced.push(fact.clone());
-                }
+    let indexes =
+        match parse_keep_indexes_with_repair(app, settings, &content, facts.len(), run_id, cancel)
+            .await
+        {
+            Ok(indexes) => indexes,
+            Err(error) => {
+                log_extract_debug(format!(
+                    "reduce facts keep_indexes failed run={} fact_count={} error={}",
+                    run_id,
+                    facts.len(),
+                    truncate_log_text(&error, 240)
+                ));
+                return Ok(fallback_reduce_facts(facts, question, profile));
             }
-        }
-    }
+        };
+
+    let mut reduced = indexes
+        .into_iter()
+        .filter_map(|index| facts.get(index - 1).cloned())
+        .collect::<Vec<_>>();
     if reduced.is_empty() {
-        Ok(facts.iter().take(MAX_REDUCED_FACTS).cloned().collect())
+        Ok(fallback_reduce_facts(facts, question, profile))
     } else {
         reduced.truncate(MAX_REDUCED_FACTS);
         Ok(reduced)
     }
+}
+
+async fn parse_keep_indexes_with_repair(
+    app: &AppHandle,
+    settings: &Settings,
+    raw_content: &str,
+    fact_count: usize,
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<usize>, String> {
+    match serde_json::from_str::<JsonValue>(raw_content) {
+        Ok(value) => match validate_keep_indexes_json(value, fact_count) {
+            Ok(indexes) => return Ok(indexes),
+            Err(schema_error) => {
+                log_extract_debug(format!(
+                    "keep_indexes schema invalid run={} fact_count={} error={} raw={}",
+                    run_id,
+                    fact_count,
+                    schema_error,
+                    truncate_log_text(raw_content, 300)
+                ));
+            }
+        },
+        Err(parse_error) => {
+            log_extract_debug(format!(
+                "keep_indexes json parse failed run={} fact_count={} error={} raw={}",
+                run_id,
+                fact_count,
+                parse_error,
+                truncate_log_text(raw_content, 300)
+            ));
+        }
+    }
+
+    let local_error = match parse_keep_indexes_locally(raw_content, fact_count) {
+        Ok(indexes) => {
+            log_extract_debug(format!(
+                "keep_indexes local repair succeeded run={} kept={}",
+                run_id,
+                indexes.len()
+            ));
+            return Ok(indexes);
+        }
+        Err(error) => {
+            log_extract_debug(format!(
+                "keep_indexes local repair failed run={} error={}",
+                run_id, error
+            ));
+            error
+        }
+    };
+
+    repair_keep_indexes_json(app, settings, raw_content, fact_count, run_id, cancel)
+        .await
+        .map_err(|repair_error| {
+            format!(
+                "keep_indexes_json_failed: local_repair={}; llm_repair={}",
+                local_error, repair_error
+            )
+        })
+}
+
+fn parse_keep_indexes_locally(raw: &str, fact_count: usize) -> Result<Vec<usize>, String> {
+    validate_keep_indexes_json(parse_json_object_locally(raw)?, fact_count)
+}
+
+fn validate_keep_indexes_json(value: JsonValue, fact_count: usize) -> Result<Vec<usize>, String> {
+    let indexes = value
+        .get("keep_indexes")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "keep_indexes_schema_invalid: keep_indexes must be an array".to_string())?;
+    let mut out = Vec::new();
+    for item in indexes {
+        let Some(raw) = item.as_u64() else {
+            return Err(
+                "keep_indexes_schema_invalid: all keep_indexes must be numbers".to_string(),
+            );
+        };
+        if raw == 0 || raw as usize > fact_count {
+            return Err(format!(
+                "keep_indexes_schema_invalid: index out of range: {}",
+                raw
+            ));
+        }
+        out.push(raw as usize);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+async fn repair_keep_indexes_json(
+    app: &AppHandle,
+    settings: &Settings,
+    raw_content: &str,
+    fact_count: usize,
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<usize>, String> {
+    log_extract_debug(format!(
+        "keep_indexes llm repair start run={} raw={}",
+        run_id,
+        truncate_log_text(raw_content, 300)
+    ));
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "次のテキストを有効なJSONに修復してください。説明文は不要です。形式は {\"keep_indexes\":[1,2,3]} のJSON objectだけにしてください。元の番号の意味を変えないでください。"
+        }),
+        json!({
+            "role": "user",
+            "content": raw_content
+        }),
+    ];
+    let repaired = call_deepseek(
+        app,
+        settings,
+        messages,
+        700,
+        true,
+        false,
+        Some(run_id),
+        cancel,
+    )
+    .await?;
+    parse_keep_indexes_locally(&repaired, fact_count).map_err(|error| {
+        format!(
+            "keep_indexes JSON repair failed: {}; raw={}",
+            error,
+            truncate_log_text(&repaired, 300)
+        )
+    })
+}
+
+fn fallback_reduce_facts(
+    facts: &[ExtractedFact],
+    question: &str,
+    profile: &QuestionProfile,
+) -> Vec<ExtractedFact> {
+    let search_terms = profile.search_terms();
+    let terms = meaningful_question_terms(question, &search_terms);
+    let mut scored = facts
+        .iter()
+        .enumerate()
+        .map(|(index, fact)| {
+            (
+                index,
+                fallback_fact_score(fact, &terms, profile),
+                fact.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    scored
+        .into_iter()
+        .take(MAX_REDUCED_FACTS)
+        .map(|(_, _, fact)| fact)
+        .collect()
+}
+
+fn fallback_fact_score(fact: &ExtractedFact, terms: &[String], profile: &QuestionProfile) -> f64 {
+    let mut score = 0.0;
+    let haystack = format!(
+        "{} {} {} {} {} {} {} {}",
+        fact.scope,
+        fact.subject,
+        fact.object,
+        fact.condition,
+        fact.effect,
+        fact.exception,
+        fact.statement,
+        fact.quote
+    );
+    let haystack_lower = haystack.to_ascii_lowercase();
+    for term in terms {
+        if haystack.contains(term) || haystack_lower.contains(&term.to_ascii_lowercase()) {
+            score += 2.0;
+        }
+    }
+    for concept in &profile.lower_concepts {
+        if haystack.contains(concept) || haystack_lower.contains(&concept.to_ascii_lowercase()) {
+            score += 3.0;
+        }
+    }
+    match fact.confidence.trim().to_ascii_lowercase().as_str() {
+        "high" => score += 2.0,
+        "medium" => score += 1.0,
+        _ => {}
+    }
+    if !fact.exception.trim().is_empty() {
+        score += 2.5;
+    }
+    if matches!(
+        fact.polarity.trim().to_ascii_lowercase().as_str(),
+        "negative" | "conditional"
+    ) {
+        score += 2.0;
+    }
+    if !fact.condition.trim().is_empty() {
+        score += 1.5;
+    }
+    if !fact.quote.trim().is_empty() {
+        score += 0.8;
+    }
+    score
 }
 
 async fn synthesize_answer(
@@ -5306,6 +5687,27 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_fact(id: i64, object: &str, statement: &str) -> ExtractedFact {
+        ExtractedFact {
+            chunk_id: id,
+            file_name: "rules.txt".to_string(),
+            path: "/tmp/rules.txt".to_string(),
+            heading_path: "第1条".to_string(),
+            char_start: 0,
+            char_end: 10,
+            statement: statement.to_string(),
+            scope: "給与規程".to_string(),
+            subject: "職員".to_string(),
+            object: object.to_string(),
+            condition: "".to_string(),
+            effect: "支給する".to_string(),
+            exception: "".to_string(),
+            polarity: "positive".to_string(),
+            quote: statement.to_string(),
+            confidence: "low".to_string(),
+        }
+    }
+
     #[test]
     fn chunker_preserves_japanese_regulation_headings() {
         let text = "第1章 総則\n（目的）\nこの規程は目的を定める。\n\n第2条 扶養手当\n扶養手当は条件を満たす職員に支給する。\n";
@@ -5317,6 +5719,74 @@ mod tests {
         assert!(chunks
             .iter()
             .any(|chunk| chunk.content.contains("扶養手当")));
+    }
+
+    #[test]
+    fn markdown_chunker_uses_heading_hierarchy() {
+        let text = "# API\n概要\n## Auth\n認証について\n### Token\nトークンを使う。\n";
+        let chunks = split_text_into_chunks_for_path(text, Path::new("spec.md"));
+
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.heading_path == "API > Auth > Token"));
+    }
+
+    #[test]
+    fn markdown_chunker_ignores_headings_inside_fenced_code() {
+        let text = "# API\n```bash\n# comment\necho hello\n```\n本文\n";
+        let chunks = split_text_into_chunks_for_path(text, Path::new("spec.markdown"));
+
+        assert!(chunks
+            .iter()
+            .all(|chunk| !chunk.heading_path.contains("comment")));
+        assert!(chunks.iter().any(|chunk| chunk.heading_path == "API"));
+    }
+
+    #[test]
+    fn markdown_chunker_preserves_japanese_regulation_headings() {
+        let text = "# 就業規則\n第1章 総則\n（目的）\nこの規程は目的を定める。\n\n第2条 扶養手当\n扶養手当は条件を満たす職員に支給する。\n";
+        let chunks = split_text_into_chunks_for_path(text, Path::new("rules.md"));
+
+        assert!(chunks.iter().any(|chunk| {
+            chunk.heading_path.contains("就業規則") && chunk.heading_path.contains("第2条 扶養手当")
+        }));
+    }
+
+    #[test]
+    fn markdown_chunker_ignores_regulation_headings_inside_fenced_code() {
+        let text = "# API\n```text\n第1条 コード内の見出し\n```\n## Auth\n本文\n";
+        let chunks = split_text_into_chunks_for_path(text, Path::new("spec.md"));
+
+        assert!(chunks
+            .iter()
+            .all(|chunk| !chunk.heading_path.contains("コード内の見出し")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.heading_path.contains("API > Auth")));
+    }
+
+    #[test]
+    fn markdown_heading_keeps_trailing_hash_when_not_closing_sequence() {
+        let parsed = parse_markdown_heading("# C#").unwrap();
+
+        assert_eq!(parsed.1, "C#");
+    }
+
+    #[test]
+    fn markdown_heading_trims_closing_hash_sequence() {
+        let parsed = parse_markdown_heading("# Title ###").unwrap();
+
+        assert_eq!(parsed.1, "Title");
+    }
+
+    #[test]
+    fn path_chunker_keeps_regulation_chunking_for_non_markdown() {
+        let text = "第1章 総則\n（目的）\nこの規程は目的を定める。\n\n第2条 扶養手当\n扶養手当は条件を満たす職員に支給する。\n";
+        let chunks = split_text_into_chunks_for_path(text, Path::new("rules.txt"));
+
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.heading_path.contains("第2条 扶養手当")));
     }
 
     #[test]
@@ -5612,6 +6082,95 @@ mod tests {
     }
 
     #[test]
+    fn keep_indexes_json_validation_accepts_valid_indexes() {
+        let indexes = validate_keep_indexes_json(json!({"keep_indexes":[3,1,1]}), 3).unwrap();
+
+        assert_eq!(indexes, vec![1, 3]);
+    }
+
+    #[test]
+    fn keep_indexes_local_repair_parses_markdown_code_fence() {
+        let indexes = parse_keep_indexes_locally(
+            r#"```json
+{"keep_indexes":[1,2]}
+```"#,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(indexes, vec![1, 2]);
+    }
+
+    #[test]
+    fn keep_indexes_json_validation_rejects_missing_schema() {
+        let error = validate_keep_indexes_json(json!({"items":[1,2]}), 3).unwrap_err();
+
+        assert!(error.contains("keep_indexes"));
+    }
+
+    #[test]
+    fn keep_indexes_json_validation_rejects_out_of_range_indexes() {
+        let error = validate_keep_indexes_json(json!({"keep_indexes":[0,999]}), 3).unwrap_err();
+
+        assert!(error.contains("out of range"));
+    }
+
+    #[test]
+    fn fallback_reduce_facts_prioritizes_question_exception_and_conditional_facts() {
+        let mut facts = (0..=MAX_REDUCED_FACTS)
+            .map(|idx| {
+                test_fact(
+                    idx as i64 + 1,
+                    "一般手当",
+                    &format!("一般手当の事実{}", idx),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut important = test_fact(9_999, "住宅手当", "住宅手当は条件付きで支給する。");
+        important.condition = "借家に居住する場合".to_string();
+        important.exception = "社宅入居者は対象外".to_string();
+        important.polarity = "conditional".to_string();
+        important.confidence = "high".to_string();
+        facts.push(important.clone());
+        let profile = QuestionProfile::from_question("住宅手当はどうなっていますか");
+
+        let reduced = fallback_reduce_facts(&facts, "住宅手当はどうなっていますか", &profile);
+
+        assert_eq!(reduced.len(), MAX_REDUCED_FACTS);
+        assert!(reduced
+            .iter()
+            .any(|fact| fact.chunk_id == important.chunk_id));
+    }
+
+    #[test]
+    fn fallback_reduce_facts_prioritizes_lower_concepts() {
+        let mut facts = (0..=MAX_REDUCED_FACTS)
+            .map(|idx| {
+                test_fact(
+                    idx as i64 + 1,
+                    "一般手当",
+                    &format!("一般手当の事実{}", idx),
+                )
+            })
+            .collect::<Vec<_>>();
+        let important = test_fact(
+            8_888,
+            "扶養手当",
+            "扶養手当は扶養親族を有する場合に支給する。",
+        );
+        facts.push(important.clone());
+        let mut profile = QuestionProfile::from_question("手当はどうなっていますか");
+        profile.lower_concepts = vec!["扶養手当".to_string()];
+
+        let reduced = fallback_reduce_facts(&facts, "手当はどうなっていますか", &profile);
+
+        assert_eq!(reduced.len(), MAX_REDUCED_FACTS);
+        assert!(reduced
+            .iter()
+            .any(|fact| fact.chunk_id == important.chunk_id));
+    }
+
+    #[test]
     fn fact_fields_generate_followup_queries_for_second_pass() {
         let facts = vec![ExtractedFact {
             chunk_id: 1,
@@ -5662,6 +6221,67 @@ mod tests {
         assert!(push_unique_fact(&mut facts, fact.clone()));
         assert!(!push_unique_fact(&mut facts, fact));
         assert_eq!(facts.len(), 1);
+    }
+
+    #[test]
+    fn push_unique_fact_keeps_different_exceptions() {
+        let mut base = ExtractedFact {
+            chunk_id: 1,
+            file_name: "rules.txt".to_string(),
+            path: "/tmp/rules.txt".to_string(),
+            heading_path: "第1条 住宅手当".to_string(),
+            char_start: 0,
+            char_end: 10,
+            statement: "住宅手当は支給する。".to_string(),
+            scope: "給与規程".to_string(),
+            subject: "職員".to_string(),
+            object: "住宅手当".to_string(),
+            condition: "借家に居住する場合".to_string(),
+            effect: "支給する".to_string(),
+            exception: "社宅入居者は対象外".to_string(),
+            polarity: "conditional".to_string(),
+            quote: "住宅手当は支給する".to_string(),
+            confidence: "high".to_string(),
+        };
+        let mut other = base.clone();
+        other.exception = "一定額を超える場合は別基準".to_string();
+
+        let mut facts = Vec::new();
+        assert!(push_unique_fact(&mut facts, base.clone()));
+        assert!(push_unique_fact(&mut facts, other));
+        assert_eq!(facts.len(), 2);
+
+        base.exception = "社宅入居者は対象外".to_string();
+        assert!(!push_unique_fact(&mut facts, base));
+    }
+
+    #[test]
+    fn push_unique_fact_keeps_different_polarity() {
+        let positive = ExtractedFact {
+            chunk_id: 1,
+            file_name: "rules.txt".to_string(),
+            path: "/tmp/rules.txt".to_string(),
+            heading_path: "第1条 住宅手当".to_string(),
+            char_start: 0,
+            char_end: 10,
+            statement: "住宅手当は支給する。".to_string(),
+            scope: "給与規程".to_string(),
+            subject: "職員".to_string(),
+            object: "住宅手当".to_string(),
+            condition: "借家に居住する場合".to_string(),
+            effect: "支給する".to_string(),
+            exception: "".to_string(),
+            polarity: "positive".to_string(),
+            quote: "住宅手当は支給する".to_string(),
+            confidence: "high".to_string(),
+        };
+        let mut negative = positive.clone();
+        negative.polarity = "negative".to_string();
+
+        let mut facts = Vec::new();
+        assert!(push_unique_fact(&mut facts, positive));
+        assert!(push_unique_fact(&mut facts, negative));
+        assert_eq!(facts.len(), 2);
     }
 
     #[test]
