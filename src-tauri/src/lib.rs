@@ -1849,8 +1849,12 @@ fn split_text_into_chunks(text: &str) -> Vec<ChunkDraft> {
 }
 
 fn split_markdown_into_chunks(text: &str) -> Vec<ChunkDraft> {
+    let heading_re =
+        Regex::new(r"^\s*(第[0-9０-９一二三四五六七八九十百千]+(章|節|款|目|条).*)\s*$").unwrap();
+    let bracket_re = Regex::new(r"^\s*（[^）]{1,60}）\s*$").unwrap();
     let mut sections = Vec::new();
-    let mut heading_stack: Vec<String> = Vec::new();
+    let mut markdown_stack: Vec<String> = Vec::new();
+    let mut regulation_stack: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut current_heading = String::new();
     let mut current_start = 0i64;
@@ -1860,13 +1864,22 @@ fn split_markdown_into_chunks(text: &str) -> Vec<ChunkDraft> {
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim();
         let is_fence = is_markdown_code_fence(trimmed);
-        let heading = if !in_code_fence && !is_fence {
+        let markdown_heading = if !in_code_fence && !is_fence {
             parse_markdown_heading(trimmed)
         } else {
             None
         };
+        let regulation_heading = if !in_code_fence
+            && !is_fence
+            && markdown_heading.is_none()
+            && (heading_re.is_match(trimmed) || bracket_re.is_match(trimmed))
+        {
+            Some(trimmed)
+        } else {
+            None
+        };
 
-        if let Some((level, heading_text)) = heading {
+        if markdown_heading.is_some() || regulation_heading.is_some() {
             if !current.trim().is_empty() {
                 let end = current_start + current.chars().count() as i64;
                 sections.push(ChunkDraft {
@@ -1880,13 +1893,13 @@ fn split_markdown_into_chunks(text: &str) -> Vec<ChunkDraft> {
             } else if current.is_empty() {
                 current_start = char_cursor;
             }
-            update_markdown_heading_stack(&mut heading_stack, level, &heading_text);
-            current_heading = heading_stack
-                .iter()
-                .filter(|heading| !heading.trim().is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" > ");
+            if let Some((level, heading_text)) = markdown_heading {
+                update_markdown_heading_stack(&mut markdown_stack, level, &heading_text);
+                regulation_stack.clear();
+            } else if let Some(heading_text) = regulation_heading {
+                update_heading_stack(&mut regulation_stack, heading_text);
+            }
+            current_heading = combined_markdown_heading_path(&markdown_stack, &regulation_stack);
         } else if current.is_empty() {
             current_start = char_cursor;
         }
@@ -1912,6 +1925,19 @@ fn split_markdown_into_chunks(text: &str) -> Vec<ChunkDraft> {
     pack_sections(sections)
 }
 
+fn combined_markdown_heading_path(
+    markdown_stack: &[String],
+    regulation_stack: &[String],
+) -> String {
+    markdown_stack
+        .iter()
+        .chain(regulation_stack.iter())
+        .filter(|heading| !heading.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" > ")
+}
+
 fn parse_markdown_heading(trimmed: &str) -> Option<(usize, String)> {
     let level = trimmed.chars().take_while(|ch| *ch == '#').count();
     if !(1..=6).contains(&level) {
@@ -1921,16 +1947,35 @@ fn parse_markdown_heading(trimmed: &str) -> Option<(usize, String)> {
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
         return None;
     }
-    let mut heading = rest.trim().to_string();
-    while heading.ends_with('#') {
-        heading.pop();
-    }
-    heading = heading.trim_end().to_string();
+    let heading = trim_markdown_heading_closing_sequence(rest.trim());
     if heading.is_empty() {
         None
     } else {
         Some((level, heading))
     }
+}
+
+fn trim_markdown_heading_closing_sequence(heading: &str) -> String {
+    let trimmed = heading.trim();
+    let mut hash_start = trimmed.len();
+    for (index, ch) in trimmed.char_indices().rev() {
+        if ch == '#' {
+            hash_start = index;
+        } else {
+            break;
+        }
+    }
+    if hash_start < trimmed.len() {
+        let before_hash = &trimmed[..hash_start];
+        if before_hash
+            .chars()
+            .last()
+            .is_some_and(|ch| ch.is_whitespace())
+        {
+            return before_hash.trim_end().to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 fn update_markdown_heading_stack(stack: &mut Vec<String>, level: usize, heading: &str) {
@@ -5695,6 +5740,43 @@ mod tests {
             .iter()
             .all(|chunk| !chunk.heading_path.contains("comment")));
         assert!(chunks.iter().any(|chunk| chunk.heading_path == "API"));
+    }
+
+    #[test]
+    fn markdown_chunker_preserves_japanese_regulation_headings() {
+        let text = "# 就業規則\n第1章 総則\n（目的）\nこの規程は目的を定める。\n\n第2条 扶養手当\n扶養手当は条件を満たす職員に支給する。\n";
+        let chunks = split_text_into_chunks_for_path(text, Path::new("rules.md"));
+
+        assert!(chunks.iter().any(|chunk| {
+            chunk.heading_path.contains("就業規則") && chunk.heading_path.contains("第2条 扶養手当")
+        }));
+    }
+
+    #[test]
+    fn markdown_chunker_ignores_regulation_headings_inside_fenced_code() {
+        let text = "# API\n```text\n第1条 コード内の見出し\n```\n## Auth\n本文\n";
+        let chunks = split_text_into_chunks_for_path(text, Path::new("spec.md"));
+
+        assert!(chunks
+            .iter()
+            .all(|chunk| !chunk.heading_path.contains("コード内の見出し")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.heading_path.contains("API > Auth")));
+    }
+
+    #[test]
+    fn markdown_heading_keeps_trailing_hash_when_not_closing_sequence() {
+        let parsed = parse_markdown_heading("# C#").unwrap();
+
+        assert_eq!(parsed.1, "C#");
+    }
+
+    #[test]
+    fn markdown_heading_trims_closing_hash_sequence() {
+        let parsed = parse_markdown_heading("# Title ###").unwrap();
+
+        assert_eq!(parsed.1, "Title");
     }
 
     #[test]
