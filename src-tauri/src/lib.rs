@@ -1995,8 +1995,7 @@ fn hybrid_search_internal(
         });
     }
 
-    let selected_set: HashSet<i64> = selected_doc_ids.iter().copied().collect();
-    let fts_ranking = run_fts_search(conn, query, &query_terms, &selected_set)?;
+    let fts_ranking = run_fts_search(conn, query, &query_terms, &selected_doc_ids)?;
     let ngram_ranking = run_ngram_search(conn, &query_terms, &selected_doc_ids)?;
     let (vector_ranking, scanned_vectors) = run_vector_search(conn, query, &selected_doc_ids)?;
 
@@ -2112,8 +2111,11 @@ fn run_fts_search(
     conn: &Connection,
     query: &str,
     query_terms: &[String],
-    selected_set: &HashSet<i64>,
+    selected_doc_ids: &[i64],
 ) -> Result<Vec<(i64, f64)>, String> {
+    if selected_doc_ids.is_empty() {
+        return Ok(vec![]);
+    }
     let mut terms = vec![query.trim().to_string()];
     terms.extend(query_terms.iter().take(12).cloned());
     terms.retain(|t| t.chars().count() >= 2);
@@ -2128,27 +2130,27 @@ fn run_fts_search(
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ");
+    let doc_placeholders = placeholders(selected_doc_ids.len());
+    let sql = format!(
+        r#"
+        SELECT c.id, bm25(chunk_fts) AS rank
+        FROM chunk_fts
+        JOIN chunks c ON c.id = chunk_fts.rowid
+        WHERE chunk_fts MATCH ?1
+          AND c.document_id IN ({})
+        ORDER BY rank
+        LIMIT 180
+        "#,
+        doc_placeholders
+    );
+    let mut values: Vec<Value> = vec![Value::Text(fts_query)];
+    values.extend(selected_doc_ids.iter().map(|id| Value::Integer(*id)));
 
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT c.id, c.document_id, bm25(chunk_fts) AS rank
-            FROM chunk_fts
-            JOIN chunks c ON c.id = chunk_fts.rowid
-            WHERE chunk_fts MATCH ?1
-            ORDER BY rank
-            LIMIT 180
-            "#,
-        )
-        .map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
     let rows = stmt
-        .query_map(params![fts_query], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, f64>(2)?,
-            ))
+        .query_map(params_from_iter(values), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
         })
         .map_err(|e| e.to_string());
 
@@ -2156,10 +2158,8 @@ fn run_fts_search(
         Ok(mapped) => {
             let mut out = Vec::new();
             for row in mapped {
-                let (chunk_id, document_id, rank) = row.map_err(|e| e.to_string())?;
-                if selected_set.contains(&document_id) {
-                    out.push((chunk_id, 1.0 / (1.0 + rank.abs())));
-                }
+                let (chunk_id, rank) = row.map_err(|e| e.to_string())?;
+                out.push((chunk_id, 1.0 / (1.0 + rank.abs())));
             }
             Ok(out)
         }
@@ -3596,7 +3596,7 @@ async fn extract_facts_from_batch(
     )
     .await?;
     let parsed =
-        serde_json::from_str::<JsonValue>(&content).unwrap_or_else(|_| json!({"facts":[]}));
+        parse_facts_json_with_repair(app, settings, &content, run_id, batch, cancel).await?;
     let mut out = Vec::new();
     if let Some(items) = parsed.get("facts").and_then(|v| v.as_array()) {
         for item in items {
@@ -3659,6 +3659,134 @@ async fn extract_facts_from_batch(
         }
     }
     Ok(out)
+}
+
+async fn parse_facts_json_with_repair(
+    app: &AppHandle,
+    settings: &Settings,
+    raw_content: &str,
+    run_id: &str,
+    batch: &[ChunkRecord],
+    cancel: &Arc<AtomicBool>,
+) -> Result<JsonValue, String> {
+    match serde_json::from_str::<JsonValue>(raw_content) {
+        Ok(value) => return Ok(value),
+        Err(parse_error) => {
+            log_extract_debug(format!(
+                "fact json parse failed run={} batch_chunks={} batch_chars={} chunk_ids={} error={} raw={}",
+                run_id,
+                batch.len(),
+                estimate_batch_chars(batch),
+                batch
+                    .iter()
+                    .take(24)
+                    .map(|chunk| chunk.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                parse_error,
+                truncate_log_text(raw_content, 300)
+            ));
+
+            match parse_json_object_locally(raw_content) {
+                Ok(value) => {
+                    log_extract_debug(format!(
+                        "fact json local repair succeeded run={} batch_chunks={}",
+                        run_id,
+                        batch.len()
+                    ));
+                    return Ok(value);
+                }
+                Err(local_error) => {
+                    log_extract_debug(format!(
+                        "fact json local repair failed run={} error={}",
+                        run_id, local_error
+                    ));
+                }
+            }
+
+            repair_facts_json(app, settings, raw_content, run_id, cancel)
+                .await
+                .map_err(|repair_error| {
+                    format!(
+                        "fact_json_parse_failed: DeepSeek応答をJSONとして解析できませんでした: {}; repair={}",
+                        parse_error, repair_error
+                    )
+                })
+        }
+    }
+}
+
+fn parse_json_object_locally(raw: &str) -> Result<JsonValue, String> {
+    match serde_json::from_str::<JsonValue>(raw) {
+        Ok(value) => return Ok(value),
+        Err(initial_error) => {
+            if let Some(candidate) = extract_json_object_candidate(raw) {
+                if candidate != raw {
+                    return serde_json::from_str::<JsonValue>(candidate).map_err(
+                        |candidate_error| {
+                            format!(
+                                "local_json_repair_failed: initial={}; candidate={}",
+                                initial_error, candidate_error
+                            )
+                        },
+                    );
+                }
+            }
+            Err(initial_error.to_string())
+        }
+    }
+}
+
+fn extract_json_object_candidate(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if start <= end {
+        Some(&raw[start..=end])
+    } else {
+        None
+    }
+}
+
+async fn repair_facts_json(
+    app: &AppHandle,
+    settings: &Settings,
+    raw_content: &str,
+    run_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<JsonValue, String> {
+    log_extract_debug(format!(
+        "fact json llm repair start run={} raw={}",
+        run_id,
+        truncate_log_text(raw_content, 300)
+    ));
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "次のテキストを有効なJSONに修復してください。説明文は不要です。形式は {\"facts\":[...]} のJSON objectだけにしてください。元の意味を変えないでください。"
+        }),
+        json!({
+            "role": "user",
+            "content": raw_content
+        }),
+    ];
+    let repaired = call_deepseek(
+        app,
+        settings,
+        messages,
+        1_400,
+        true,
+        false,
+        Some(run_id),
+        cancel,
+    )
+    .await?;
+    parse_json_object_locally(&repaired).map_err(|error| {
+        format!(
+            "fact JSON repair failed: {}; raw={}",
+            error,
+            truncate_log_text(&repaired, 300)
+        )
+    })
 }
 
 fn fact_field(item: &JsonValue, key: &str) -> String {
@@ -5164,6 +5292,62 @@ mod tests {
     }
 
     #[test]
+    fn fts_search_filters_selected_documents_before_limit() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("mini-lm-test.sqlite3");
+        let state = AppStateInner::new(db_path);
+        init_db(&state).unwrap();
+        let conn = state.conn().unwrap();
+        let indexed_at = Utc::now().to_rfc3339();
+
+        conn.execute(
+            "INSERT INTO documents(id, path, file_name, selected, status) VALUES (1, '/tmp/a.txt', 'a.txt', 0, 'indexed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, path, file_name, selected, status) VALUES (2, '/tmp/b.txt', 'b.txt', 1, 'indexed')",
+            [],
+        )
+        .unwrap();
+
+        for id in 1..=181 {
+            conn.execute(
+                r#"
+                INSERT INTO chunks(id, document_id, ordinal, char_start, char_end, heading_path, content, content_hash, indexed_at)
+                VALUES (?1, 1, ?2, 0, 20, '未選択', 'allowance allowance allowance', ?3, ?4)
+                "#,
+                params![id, id, format!("a-{id}"), indexed_at],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunk_fts(rowid, content, heading_path, file_name) VALUES (?1, 'allowance allowance allowance', '未選択', 'a.txt')",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        conn.execute(
+            r#"
+            INSERT INTO chunks(id, document_id, ordinal, char_start, char_end, heading_path, content, content_hash, indexed_at)
+            VALUES (1000, 2, 1, 0, 20, '選択中', 'allowance exists in selected document.', 'b-1', ?1)
+            "#,
+            params![indexed_at],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunk_fts(rowid, content, heading_path, file_name) VALUES (1000, 'allowance exists in selected document.', '選択中', 'b.txt')",
+            [],
+        )
+        .unwrap();
+
+        let hits = run_fts_search(&conn, "allowance", &extract_terms("allowance"), &[2]).unwrap();
+
+        assert!(hits.iter().any(|(chunk_id, _)| *chunk_id == 1000));
+        assert!(hits.iter().all(|(chunk_id, _)| *chunk_id == 1000));
+    }
+
+    #[test]
     fn index_builds_hierarchy_contexts_for_parent_recall() {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("mini-lm-test.sqlite3");
@@ -5323,6 +5507,37 @@ mod tests {
         assert!(statement.contains("object=扶養手当"));
         assert!(statement.contains("condition=扶養親族を有する場合"));
         assert!(statement.contains("effect=支給する"));
+    }
+
+    #[test]
+    fn fact_json_local_repair_parses_markdown_code_fence() {
+        let parsed = parse_json_object_locally(
+            r#"```json
+{"facts":[{"chunk_id":1,"statement":"扶養手当は支給する。"}]}
+```"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed["facts"][0]["chunk_id"], 1);
+    }
+
+    #[test]
+    fn fact_json_local_repair_extracts_json_from_surrounding_text() {
+        let parsed = parse_json_object_locally(
+            r#"以下が抽出結果です。
+{"facts":[{"chunk_id":2,"statement":"住宅手当は条件付きで支給する。"}]}
+以上です。"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed["facts"][0]["chunk_id"], 2);
+    }
+
+    #[test]
+    fn fact_json_local_repair_returns_error_for_invalid_json() {
+        let error = parse_json_object_locally("facts: [broken]").unwrap_err();
+
+        assert!(!error.is_empty());
     }
 
     #[test]
